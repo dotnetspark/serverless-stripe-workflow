@@ -1,0 +1,67 @@
+openapi: 3.0.3
+info:
+  title: Serverless Stripe Workflow API
+  version: 0.1.0
+servers:
+  - url: https://api.example.com/api/v1
+paths:
+  /checkout/session:
+    post:
+      summary: Create Stripe Checkout Session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                items:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      productId:
+                        type: string
+                      quantity:
+                        type: integer
+                        minimum: 1
+                customerEmail:
+                  type: string
+              required: [orderId, items, customerEmail]
+      responses:
+        "200":
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  url:
+                    type: string
+        "400": { description: Invalid request }
+        "409": { description: Duplicate order }
+  /webhooks/stripe:
+    post:
+      summary: Stripe Webhook Receiver
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200": { description: Event processed }
+        "400": { description: Signature verification failed }
+        "500": { description: Processing error }
+components:
+  securitySchemes:
+    stripeSignature:
+      type: apiKey
+      in: header
+      name: Stripe-Signature
+security:
+  - stripeSignature: []

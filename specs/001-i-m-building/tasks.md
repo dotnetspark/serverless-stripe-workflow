@@ -1,9 +1,9 @@
 # Tasks: Serverless Stripe Payment Workflow
 
-Feature dir: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-serverless-stripe-workflow
-Plan: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-serverless-stripe-workflow\\plan.md
-Spec: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-serverless-stripe-workflow\\spec.md
-Contracts: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-serverless-stripe-workflow\\contracts\\openapi.yaml
+Feature dir: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-i-m-building
+Plan: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-i-m-building\\plan.md
+Spec: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-i-m-building\\spec.md
+Contracts: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-i-m-building\\contracts\\openapi.yaml
 
 Guidance:
 
@@ -86,7 +86,7 @@ T007. Introduce .NET Aspire orchestration (AppHost + ServiceDefaults)
 T008. Wire frontend and functions into Aspire AppHost
 
 - Reference projects: frontend/blazor-client, backend/azure-functions/src/\*
-- Configure endpoints, environment variables (STRIPE*\_, SENDGRID*_, TWILIO\*_, APP_BASE_URL, ALLOWED_ORIGIN).
+- Configure endpoints, environment variables (STRIPE*\*, SENDGRID*_, TWILIO\__, APP_BASE_URL, ALLOWED_ORIGIN).
 - Output: `dotnet run` AppHost starts dependent projects with correct env.
 - Dependencies: T002, T003, T007
 
@@ -103,7 +103,7 @@ T009. Add dev containers/emulators to Aspire (optional)
 T010. Create contract test project
 
 - Path: tests/contract
-- Setup .NET test project (xUnit or NUnit), helpers to load OpenAPI: specs/001-serverless-stripe-workflow/contracts/openapi.yaml
+- Setup .NET test project (xUnit or NUnit), helpers to load OpenAPI: specs/001-i-m-building/contracts/openapi.yaml
 - Output: project builds with a failing placeholder test.
 - Dependencies: T001
 

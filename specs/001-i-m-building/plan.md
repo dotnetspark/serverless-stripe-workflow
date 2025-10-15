@@ -1,7 +1,7 @@
-# Implementation Plan: [FEATURE]
+# Implementation Plan: Serverless Stripe Payment Workflow
 
-**Branch**: `[###-feature-name]` | **Date**: [DATE] | **Spec**: [link]
-**Input**: Feature specification from `/specs/[###-feature-name]/spec.md`
+**Branch**: `001-i-m-building` | **Date**: 2025-10-15 | **Spec**: C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-i-m-building\\spec.md
+**Input**: Feature specification from `C:\\Users\\ylrre\\source\\repos\\serverless-stripe-workflow\\specs\\001-i-m-building\\spec.md`
 
 ## Execution Flow (/plan command scope)
 
@@ -33,25 +33,95 @@
 
 ## Summary
 
-[Extract from feature spec: primary requirement + technical approach from research]
+Deliver a serverless payments flow using Stripe with a sleek Blazor WebAssembly frontend (Tailwind CSS), mocked product listing and cart, and three backend services: create checkout session, handle payment webhooks, and send notifications. Primary deployment on Azure Functions with AWS Lambda as automatic failover to achieve zero downtime. Default locale/currency en-US/USD. Notifications via SendGrid (email default) and optional Twilio SMS opt-in.
+
+## Architecture diagram
+
+```mermaid
+flowchart LR
+   %% Client
+   subgraph Client
+      FE[Blazor WebAssembly (Tailwind CSS)]
+   end
+
+   %% Routing / Failover
+   Route[Health-based Routing\n(DNS/Traffic Manager)]
+
+   %% Primary Cloud (Azure)
+   subgraph AZURE[Azure Functions (Primary)]
+      AF1[Checkout Service\nPOST /api/v1/checkout/session]
+      AF2[Webhook Service\nPOST /api/v1/webhooks/stripe]
+      AF3[Notify Service\nEmail/SMS]
+   end
+
+   %% Fallback Cloud (AWS)
+   subgraph AWS[AWS Lambda (Fallback)]
+      LW1[Checkout Function]
+      LW2[Webhook Function]
+      LW3[Notify Function]
+   end
+
+   %% External Providers
+   Stripe[Stripe]
+   SendGrid[SendGrid Email]
+   Twilio[Twilio SMS]
+
+   %% Edges
+   FE --> Route
+   Route -->|Healthy| AF1
+   Route -->|Failover| LW1
+
+   AF1 --> Stripe
+   LW1 --> Stripe
+
+   Stripe --> AF2
+   Stripe --> LW2
+
+   AF2 --> AF3
+   LW2 --> LW3
+
+   AF3 --> SendGrid
+   AF3 --> Twilio
+   LW3 --> SendGrid
+   LW3 --> Twilio
+
+   %% Notes
+   classDef primary fill:#e6f7ff,stroke:#1890ff,color:#000
+   classDef fallback fill:#fff7e6,stroke:#fa8c16,color:#000
+   class AZURE primary
+   class AWS fallback
+```
 
 ## Technical Context
 
-**Language/Version**: [e.g., Python 3.11, Swift 5.9, Rust 1.75 or NEEDS CLARIFICATION]  
-**Primary Dependencies**: [e.g., FastAPI, UIKit, LLVM or NEEDS CLARIFICATION]  
-**Storage**: [if applicable, e.g., PostgreSQL, CoreData, files or N/A]  
-**Testing**: [e.g., pytest, XCTest, cargo test or NEEDS CLARIFICATION]  
-**Target Platform**: [e.g., Linux server, iOS 15+, WASM or NEEDS CLARIFICATION]
-**Project Type**: [single/web/mobile - determines source structure]  
-**Performance Goals**: [domain-specific, e.g., 1000 req/s, 10k lines/sec, 60 fps or NEEDS CLARIFICATION]  
-**Constraints**: [domain-specific, e.g., <200ms p95, <100MB memory, offline-capable or NEEDS CLARIFICATION]  
-**Scale/Scope**: [domain-specific, e.g., 10k users, 1M LOC, 50 screens or NEEDS CLARIFICATION]
+**Language/Version**: Latest .NET (current SDK at time of implementation)  
+**Frontend**: Blazor WebAssembly + Tailwind CSS (latest); responsive, mobile-first; branding/colors best guess now  
+**Backend**: Azure Functions (primary) with AWS Lambda fallback; three services (checkout session creation, webhook listener, notification sender)  
+**Payments**: Stripe Checkout/Payment Intents (.NET SDK); webhook signature verification; idempotency  
+**Notifications**: SendGrid (email default), Twilio (optional SMS)  
+**Storage**: Serverless key-value per cloud: Azure Table Storage (primary) and DynamoDB (fallback) for minimal order/payment records  
+**Testing**: xUnit/NUnit for .NET, Stripe CLI for webhook testing  
+**Target Platform**: Web (WASM frontend), Azure Functions, AWS Lambda  
+**Project Type**: Web application (frontend + backend)  
+**Performance Goals**: Confirmation sent within 2 minutes of payment event; failover switch < 1 minute when primary unhealthy  
+**Constraints**: PCI SAQ-A only; do not handle card data; keep endpoints under ~10s runtime; idempotent operations  
+**Scale/Scope**: MVP storefront with mocked catalog; future multi-locale support
+
+Technical Context (from user input): Latest .NET; Blazor WASM + Tailwind; email default via SendGrid + optional SMS via Twilio; US locale first; Azure Functions primary with AWS Lambda fallback for zero downtime.
+
+Dev Orchestration: .NET Aspire for local developer experience (AppHost + ServiceDefaults) to run frontend, Azure Functions, and dev dependencies together with shared configuration, secrets, and OpenTelemetry tracing/logging.
 
 ## Constitution Check
 
 _GATE: Must pass before Phase 0 research. Re-check after Phase 1 design._
 
-[Gates determined based on constitution file]
+- Endpoints minimality: Provide POST /api/v1/checkout/session and POST /api/v1/webhooks/stripe — PASS
+- Security: Secrets server-side only; webhook signature verification; CORS restricted; server-side price validation — PASS
+- Idempotency: Idempotency-Key and orderId-based deduplication for writes and webhook handling — PASS
+- Event-driven truth: Persist state transitions on webhooks; handle retries/out-of-order — PASS
+- Test parity: Use Stripe test mode and stripe-cli for local; shared code paths — PASS
+- Observability: Structured JSON logs with correlation IDs — PASS
+- Portability: Serverless-first with Azure primary, AWS fallback — PASS
 
 ## Project Structure
 
@@ -76,44 +146,40 @@ specs/[###-feature]/
   not include Option labels.
 -->
 
+ios/ or android/
+
 ```
-# [REMOVE IF UNUSED] Option 1: Single project (DEFAULT)
-src/
-├── models/
-├── services/
-├── cli/
-└── lib/
+frontend/
+├── blazor-client/                 # Blazor WebAssembly app (Tailwind CSS)
+│   ├── src/
+│   │   ├── components/
+│   │   ├── pages/
+│   │   └── services/
+│   └── tests/
+
+backend/
+├── azure-functions/               # Primary serverless backend
+│   └── src/
+│       ├── Checkout/              # POST /api/v1/checkout/session
+│       ├── Webhooks/              # POST /api/v1/webhooks/stripe
+│       └── Notify/                # Internal trigger for SendGrid/Twilio
+├── aws-lambda/                    # Fallback backend
+│   └── src/
+│       ├── Checkout/
+│       ├── Webhooks/
+│       └── Notify/
 
 tests/
 ├── contract/
 ├── integration/
 └── unit/
 
-# [REMOVE IF UNUSED] Option 2: Web application (when "frontend" + "backend" detected)
-backend/
-├── src/
-│   ├── models/
-│   ├── services/
-│   └── api/
-└── tests/
-
-frontend/
-├── src/
-│   ├── components/
-│   ├── pages/
-│   └── services/
-└── tests/
-
-# [REMOVE IF UNUSED] Option 3: Mobile + API (when "iOS/Android" detected)
-api/
-└── [same as backend above]
-
-ios/ or android/
-└── [platform-specific structure: feature modules, UI flows, platform tests]
+orchestrator/
+├── Aspire.AppHost/               # .NET Aspire AppHost project (entrypoint)
+└── Aspire.ServiceDefaults/       # Shared defaults: OpenTelemetry, health, config
 ```
 
-**Structure Decision**: [Document the selected structure and reference the real
-directories captured above]
+**Structure Decision**: Web application with separate frontend and backend; dual-cloud backend (Azure primary, AWS fallback) reflecting availability requirement.
 
 ## Phase 0: Outline & Research
 
@@ -223,8 +289,8 @@ _This checklist is updated during execution flow_
 
 **Phase Status**:
 
-- [ ] Phase 0: Research complete (/plan command)
-- [ ] Phase 1: Design complete (/plan command)
+- [x] Phase 0: Research complete (/plan command)
+- [x] Phase 1: Design complete (/plan command)
 - [ ] Phase 2: Task planning complete (/plan command - describe approach only)
 - [ ] Phase 3: Tasks generated (/tasks command)
 - [ ] Phase 4: Implementation complete
@@ -232,9 +298,9 @@ _This checklist is updated during execution flow_
 
 **Gate Status**:
 
-- [ ] Initial Constitution Check: PASS
-- [ ] Post-Design Constitution Check: PASS
-- [ ] All NEEDS CLARIFICATION resolved
+- [x] Initial Constitution Check: PASS
+- [x] Post-Design Constitution Check: PASS
+- [x] All NEEDS CLARIFICATION resolved
 - [ ] Complexity deviations documented
 
 ---

@@ -1,0 +1,116 @@
+name: Deploy to Azure Functions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AZURE_FUNCTIONAPP_NAME: "stripe-workflow-functions"
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: "./src/backend/hosting/azure-functions"
+  DOTNET_VERSION: "9.0.x"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: "Checkout GitHub Action"
+        uses: actions/checkout@v4
+
+      - name: "Setup .NET Core SDK"
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: "Login to Azure"
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: "Get secrets from Azure Key Vault"
+        uses: Azure/get-keyvault-secrets@v1
+        with:
+          keyvault: ${{ secrets.AZURE_KEYVAULT_NAME }}
+          secrets: |
+            StripeSecretKey
+            StripePublishableKey
+            StripeWebhookSecret
+            CosmosConnectionString
+            SendGridApiKey
+            TwilioAccountSid
+            TwilioAuthToken
+        id: keyvault-secrets
+
+      - name: "Restore dependencies"
+        run: dotnet restore
+        working-directory: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+
+      - name: "Build project"
+        run: dotnet build --configuration Release --no-restore
+        working-directory: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+
+      - name: "Run tests"
+        run: dotnet test --configuration Release --no-build --verbosity normal
+        working-directory: "./tests"
+
+      - name: "Publish Azure Functions"
+        run: dotnet publish --configuration Release --output ./output
+        working-directory: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+
+      - name: "Deploy Checkout Function"
+        uses: Azure/functions-action@v1
+        with:
+          app-name: "${{ env.AZURE_FUNCTIONAPP_NAME }}-checkout"
+          package: "${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/src/Checkout/output"
+
+      - name: "Deploy Webhooks Function"
+        uses: Azure/functions-action@v1
+        with:
+          app-name: "${{ env.AZURE_FUNCTIONAPP_NAME }}-webhooks"
+          package: "${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/src/Webhooks/output"
+
+      - name: "Deploy Notify Function"
+        uses: Azure/functions-action@v1
+        with:
+          app-name: "${{ env.AZURE_FUNCTIONAPP_NAME }}-notify"
+          package: "${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}/src/Notify/output"
+
+      - name: "Configure Function App Settings with Key Vault References"
+        run: |
+          # Checkout Function Settings
+          az functionapp config appsettings set \
+            --name '${{ env.AZURE_FUNCTIONAPP_NAME }}-checkout' \
+            --resource-group rg-stripe-workflow \
+            --settings \
+              "Stripe__SecretKey=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=StripeSecretKey)" \
+              "Stripe__PublishableKey=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=StripePublishableKey)" \
+              "CosmosDb__ConnectionString=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=CosmosConnectionString)" \
+              "FUNCTIONS_WORKER_RUNTIME=dotnet-isolated"
+
+          # Webhooks Function Settings  
+          az functionapp config appsettings set \
+            --name '${{ env.AZURE_FUNCTIONAPP_NAME }}-webhooks' \
+            --resource-group rg-stripe-workflow \
+            --settings \
+              "Stripe__SecretKey=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=StripeSecretKey)" \
+              "Stripe__WebhookSecret=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=StripeWebhookSecret)" \
+              "CosmosDb__ConnectionString=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=CosmosConnectionString)" \
+              "FUNCTIONS_WORKER_RUNTIME=dotnet-isolated"
+
+          # Notify Function Settings
+          az functionapp config appsettings set \
+            --name '${{ env.AZURE_FUNCTIONAPP_NAME }}-notify' \
+            --resource-group rg-stripe-workflow \
+            --settings \
+              "SendGrid__ApiKey=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=SendGridApiKey)" \
+              "Twilio__AccountSid=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=TwilioAccountSid)" \
+              "Twilio__AuthToken=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=TwilioAuthToken)" \
+              "CosmosDb__ConnectionString=@Microsoft.KeyVault(VaultName=${{ secrets.AZURE_KEYVAULT_NAME }};SecretName=CosmosConnectionString)" \
+              "FUNCTIONS_WORKER_RUNTIME=dotnet-isolated"
+
+      - name: "Logout from Azure"
+        run: az logout

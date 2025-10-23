@@ -95,25 +95,30 @@ flowchart LR
 ## Technical Context
 
 **Language/Version**: Latest .NET (current SDK at time of implementation)  
-**Frontend**: Blazor WebAssembly + Tailwind CSS (latest); responsive, mobile-first; branding/colors best guess now  
+**Frontend**: Blazor WebAssembly + Tailwind CSS (latest); hosted on Azure Static Web Apps (FREE tier)  
 **Backend**: Azure Functions (primary) with AWS Lambda fallback; three services (checkout session creation, webhook listener, notification sender)  
 **Payments**: Stripe Checkout/Payment Intents (.NET SDK); webhook signature verification; idempotency  
 **Notifications**: SendGrid (email default), Twilio (optional SMS)  
-**Storage**: Serverless key-value per cloud: Azure Table Storage (primary) and DynamoDB (fallback) for minimal order/payment records  
-**Testing**: xUnit/NUnit for .NET, Stripe CLI for webhook testing  
+**Storage**: Cosmos DB serverless (primary) with Azure Table Storage for logs; DynamoDB (AWS fallback)  
+**Cost Optimization**: FREE tier focus - Static Web Apps (FREE), App Insights (FREE), Cosmos DB serverless consumption-only  
+**Observability**: Hybrid approach - Application Insights free tier + Grafana + Azure Storage structured logging (~$2/month vs $37/month ELK)  
+**Multi-Cloud**: Azure Front Door for global load balancing and automatic failover between Azure Functions and AWS Lambda  
+**Testing**: xUnit for .NET, NBomber for performance testing, Stripe CLI for webhook testing  
 **Target Platform**: Web (WASM frontend), Azure Functions, AWS Lambda  
-**Project Type**: Web application (frontend + backend)  
+**Project Type**: Web application with enterprise-grade architecture patterns  
 **Performance Goals**: Confirmation sent within 2 minutes of payment event; failover switch < 1 minute when primary unhealthy  
-**Constraints**: PCI SAQ-A only; do not handle card data; keep endpoints under ~10s runtime; idempotent operations  
-**Scale/Scope**: MVP storefront with mocked catalog; future multi-locale support
+**Constraints**: PCI SAQ-A only; do not handle card data; keep endpoints under ~10s runtime; idempotent operations; cost optimization priority  
+**Scale/Scope**: Portfolio demonstration with enterprise patterns; cost optimized from ~$800/month to ~$12/month
 
-Technical Context (from user input): Latest .NET; Blazor WASM + Tailwind; email default via SendGrid + optional SMS via Twilio; US locale first; Azure Functions primary with AWS Lambda fallback for zero downtime.
+**Dev Orchestration**: .NET Aspire for one-command local development (AppHost + ServiceDefaults) orchestrating frontend, Azure Functions, Cosmos DB emulator, Storage emulator, Service Bus, and Grafana with shared configuration, secrets, and OpenTelemetry tracing/logging.
 
-Dev Orchestration: .NET Aspire for local developer experience (AppHost + ServiceDefaults) to run frontend, Azure Functions, and dev dependencies together with shared configuration, secrets, and OpenTelemetry tracing/logging.
+**Architecture Philosophy**: Portfolio Excellence through Cost Consciousness - demonstrate enterprise-grade patterns using primarily free/low-cost Azure services with comprehensive observability and multi-cloud resilience.
 
 ## Constitution Check
 
 _GATE: Must pass before Phase 0 research. Re-check after Phase 1 design._
+
+**Implementation Principles**:
 
 - Endpoints minimality: Provide POST /api/v1/checkout/session and POST /api/v1/webhooks/stripe — PASS
 - Security: Secrets server-side only; webhook signature verification; CORS restricted; server-side price validation — PASS
@@ -122,6 +127,14 @@ _GATE: Must pass before Phase 0 research. Re-check after Phase 1 design._
 - Test parity: Use Stripe test mode and stripe-cli for local; shared code paths — PASS
 - Observability: Structured JSON logs with correlation IDs — PASS
 - Portability: Serverless-first with Azure primary, AWS fallback — PASS
+
+**Foundational Principles**:
+
+- Portfolio Excellence: Demonstrates enterprise-grade architecture patterns and best practices — PASS
+- Cost Consciousness: Prioritizes free/low-cost tiers; optimized from ~$800/month to ~$12/month — PASS
+- Developer Experience First: .NET Aspire enables one-command local development with full observability — PASS
+- Observability as Foundation: Hybrid Application Insights + Grafana provides comprehensive monitoring — PASS
+- Resilience by Design: Multi-cloud failover with Azure Front Door and AWS Lambda backup — PASS
 
 ## Project Structure
 
@@ -149,34 +162,47 @@ specs/[###-feature]/
 ios/ or android/
 
 ```
-frontend/
-├── blazor-client/                 # Blazor WebAssembly app (Tailwind CSS)
-│   ├── src/
-│   │   ├── components/
-│   │   ├── pages/
-│   │   └── services/
-│   └── tests/
-
-backend/
-├── azure-functions/               # Primary serverless backend
-│   └── src/
-│       ├── Checkout/              # POST /api/v1/checkout/session
-│       ├── Webhooks/              # POST /api/v1/webhooks/stripe
-│       └── Notify/                # Internal trigger for SendGrid/Twilio
-├── aws-lambda/                    # Fallback backend
-│   └── src/
-│       ├── Checkout/
-│       ├── Webhooks/
-│       └── Notify/
-
-tests/
-├── contract/
-├── integration/
-└── unit/
-
-orchestrator/
-├── Aspire.AppHost/               # .NET Aspire AppHost project (entrypoint)
-└── Aspire.ServiceDefaults/       # Shared defaults: OpenTelemetry, health, config
+src/
+├── frontend/
+│   └── blazor-client/             # Blazor WebAssembly app (Tailwind CSS) → Azure Static Web Apps (FREE)
+│       ├── src/
+│       │   ├── components/
+│       │   ├── pages/
+│       │   └── services/
+│       └── tests/
+├── backend/
+│   ├── shared/                    # Shared business logic (platform-agnostic)
+│   │   ├── Domain/                # Domain models and contracts
+│   │   ├── Handlers/              # Core business logic handlers
+│   │   │   ├── CheckoutHandler.cs # Stripe checkout logic
+│   │   │   ├── WebhookHandler.cs  # Payment webhook processing
+│   │   │   └── NotificationHandler.cs # Email/SMS notifications
+│   │   ├── Services/              # Application services (observability, persistence)
+│   │   └── Repositories/          # Data access abstractions
+│   └── hosting/                   # Platform-specific adapters
+│       ├── azure-functions/       # Azure Functions hosting (primary)
+│       │   └── src/
+│       │       ├── Checkout/      # Thin wrapper → CheckoutHandler
+│       │       ├── Webhooks/      # Thin wrapper → WebhookHandler
+│       │       └── Notify/        # Thin wrapper → NotificationHandler
+│       └── aws-lambda/            # AWS Lambda hosting (failover)
+│           └── src/               # Same handlers, Lambda packaging
+├── tests/                         # Consolidated root-level test structure
+│   ├── integration/               # End-to-end workflow tests
+│   ├── unit/                      # Business logic unit tests
+│   ├── performance/               # NBomber load tests
+│   └── contract/                  # API contract validation
+├── orchestrator/                  # .NET Aspire orchestration (one-command startup)
+│   ├── Aspire.AppHost/            # AppHost project (dev environment entrypoint)
+│   └── Aspire.ServiceDefaults/    # Shared defaults: OpenTelemetry, health, config
+├── infrastructure/                # Infrastructure-as-Code
+│   ├── azure/                     # Bicep templates for Azure deployment
+│   ├── aws/                       # CloudFormation/CDK for AWS fallback
+│   └── monitoring/                # Grafana dashboards and alert configurations
+└── docs/                          # Comprehensive documentation
+    ├── AZURE_DEPLOYMENT_GUIDE.md  # Step-by-step deployment instructions
+    ├── COST_OPTIMIZATION.md       # Cost analysis and optimization strategies
+    └── OBSERVABILITY_GUIDE.md     # Monitoring and troubleshooting guide
 ```
 
 **Structure Decision**: Web application with separate frontend and backend; dual-cloud backend (Azure primary, AWS fallback) reflecting availability requirement.

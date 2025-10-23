@@ -1,0 +1,104 @@
+service: serverless-stripe-workflow
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: dotnet8
+  region: ${opt:region, 'us-east-1'}
+  memorySize: 512
+  timeout: 30
+  environment:
+    STRIPE_SECRET_KEY: ${env:STRIPE_SECRET_KEY}
+    STRIPE_WEBHOOK_SECRET: ${env:STRIPE_WEBHOOK_SECRET}
+    SENDGRID_API_KEY: ${env:SENDGRID_API_KEY}
+    TWILIO_ACCOUNT_SID: ${env:TWILIO_ACCOUNT_SID}
+    TWILIO_AUTH_TOKEN: ${env:TWILIO_AUTH_TOKEN}
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt NotificationQueue.Arn
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+          Resource: !GetAtt OrdersTable.Arn
+
+package:
+  artifact: bin/Release/net8.0/publish/AwsLambda.zip
+
+functions:
+  checkout:
+    handler: AwsLambda::AwsLambda.Functions.CheckoutFunction::CreateCheckoutSession
+    events:
+      - http:
+          path: v1/checkout/session
+          method: post
+          cors: true
+
+  webhook:
+    handler: AwsLambda::AwsLambda.Functions.WebhookFunction::ProcessStripeWebhook
+    events:
+      - http:
+          path: v1/webhooks/stripe
+          method: post
+
+  notification:
+    handler: AwsLambda::AwsLambda.Functions.NotificationFunction::ProcessNotification
+    events:
+      - sqs:
+          arn: !GetAtt NotificationQueue.Arn
+          batchSize: 10
+
+  notification-retry:
+    handler: AwsLambda::AwsLambda.Functions.NotificationFunction::RetryFailedNotifications
+    events:
+      - schedule: rate(5 minutes)
+
+resources:
+  Resources:
+    NotificationQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-notifications-${sls:stage}
+        VisibilityTimeoutSeconds: 180
+        MessageRetentionPeriod: 1209600 # 14 days
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt NotificationDeadLetterQueue.Arn
+          maxReceiveCount: 3
+
+    NotificationDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-notifications-dlq-${sls:stage}
+
+    OrdersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-orders-${sls:stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: status
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: status-index
+            KeySchema:
+              - AttributeName: status
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL

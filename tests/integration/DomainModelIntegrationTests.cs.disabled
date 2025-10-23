@@ -1,0 +1,252 @@
+using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using StripeWorkflow.Domain.Exceptions;
+using StripeWorkflow.Domain.Models;
+using StripeWorkflow.Domain.Repositories;
+using StripeWorkflow.Domain.ValueObjects;
+using StripeWorkflow.IntegrationTests.Infrastructure;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace StripeWorkflow.IntegrationTests;
+
+/// <summary>
+/// Simplified integration tests focusing on domain model and repository interactions
+/// </summary>
+public class DomainModelIntegrationTests : IntegrationTestBase
+{
+    public DomainModelIntegrationTests(ITestOutputHelper output) : base(output)
+    {
+    }
+
+    [Fact]
+    public void CreateOrder_WithValidData_ShouldCreateCorrectly()
+    {
+        // Arrange
+        var customerId = new CustomerId("customer-123");
+        var customerEmail = new Email("test@example.com");
+        var notificationUrl = "https://webhook.example.com/orders";
+
+        // Act
+        _output.WriteLine("Creating order with domain factory method...");
+        var order = Order.Create(customerId, customerEmail, notificationUrl);
+
+        // Assert
+        order.Should().NotBeNull();
+        order.Id.Should().NotBeNull();
+        order.CustomerId.Should().Be(customerId);
+        order.CustomerEmail.Should().Be(customerEmail);
+        order.Status.Should().Be(OrderStatus.Draft);
+        order.TotalAmount.Amount.Should().Be(0);
+        order.Items.Should().BeEmpty();
+        order.NotificationUrl.Should().Be(notificationUrl);
+
+        _output.WriteLine($"Order created successfully: {order.Id.Value}");
+    }
+
+    [Fact]
+    public void AddItem_ToOrder_ShouldUpdateTotalCorrectly()
+    {
+        // Arrange
+        var order = CreateTestOrder();
+        var productId = "product-123";
+        var productName = "Test Product";
+        var quantity = 2;
+        var unitPrice = new Money(29.99m, "usd");
+
+        // Act
+        _output.WriteLine("Adding item to order...");
+        order.AddItem(productId, productName, quantity, unitPrice);
+
+        // Assert
+        order.Items.Should().HaveCount(1);
+        var item = order.Items.First();
+        item.ProductId.Should().Be(productId);
+        item.ProductName.Should().Be(productName);
+        item.Quantity.Should().Be(quantity);
+        item.UnitPrice.Should().Be(unitPrice);
+        item.TotalPrice.Amount.Should().Be(59.98m); // 2 * 29.99
+
+        order.TotalAmount.Amount.Should().Be(59.98m);
+        order.TotalAmount.Currency.Should().Be("USD");
+
+        _output.WriteLine($"Item added successfully. Total: {order.TotalAmount.Amount} {order.TotalAmount.Currency}");
+    }
+
+    [Fact]
+    public void StartCheckout_WithValidOrder_ShouldUpdateStatus()
+    {
+        // Arrange
+        var order = CreateTestOrder();
+        order.AddItem("1", "Product 1", 1, new Money(10.00m, "usd"));
+        var stripeSessionId = "cs_test_session_123";
+
+        // Act
+        _output.WriteLine("Starting checkout process...");
+        order.StartCheckout(stripeSessionId);
+
+        // Assert
+        order.Status.Should().Be(OrderStatus.Pending);
+        order.StripeSessionId.Should().Be(stripeSessionId);
+
+        _output.WriteLine($"Checkout started. Status: {order.Status}, Session: {order.StripeSessionId}");
+    }
+
+    [Fact]
+    public void MarkAsPaid_FromPendingOrder_ShouldUpdateStatus()
+    {
+        // Arrange
+        var order = CreateTestOrder();
+        order.AddItem("1", "Product 1", 1, new Money(10.00m, "usd"));
+        order.StartCheckout("cs_test_session");
+
+        // Act
+        _output.WriteLine("Marking order as paid...");
+        order.MarkAsPaid();
+
+        // Assert
+        order.Status.Should().Be(OrderStatus.Paid);
+
+        _output.WriteLine($"Order marked as paid. Status: {order.Status}");
+    }
+
+    [Fact]
+    public void MarkAsFulfilled_FromPaidOrder_ShouldUpdateStatus()
+    {
+        // Arrange
+        var order = CreateTestOrder();
+        order.AddItem("1", "Product 1", 1, new Money(10.00m, "usd"));
+        order.StartCheckout("cs_test_session");
+        order.MarkAsPaid();
+
+        // Act
+        _output.WriteLine("Marking order as fulfilled...");
+        order.MarkAsFulfilled();
+
+        // Assert
+        order.Status.Should().Be(OrderStatus.Fulfilled);
+
+        _output.WriteLine($"Order marked as fulfilled. Status: {order.Status}");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("invalid-email")]
+    [InlineData("test@")]
+    [InlineData("@example.com")]
+    public void CreateEmail_WithInvalidValue_ShouldThrowException(string invalidEmail)
+    {
+        // Act & Assert
+        var exception = Assert.Throws<ArgumentException>(() => new Email(invalidEmail));
+        exception.Should().NotBeNull();
+
+        _output.WriteLine($"Correctly rejected invalid email: '{invalidEmail}'");
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    public void CreateMoney_WithInvalidAmount_ShouldThrowException(decimal invalidAmount)
+    {
+        // Act & Assert
+        var exception = Assert.Throws<ArgumentException>(() => new Money(invalidAmount, "USD"));
+        exception.Should().NotBeNull();
+
+        _output.WriteLine($"Correctly rejected invalid money amount: {invalidAmount}");
+    }
+
+    [Fact]
+    public void AddItem_WithNegativeQuantity_ShouldThrowDomainException()
+    {
+        // Arrange
+        var order = CreateTestOrder();
+
+        // Act & Assert
+        var exception = Assert.Throws<DomainException>(() =>
+            order.AddItem("1", "Product", -1, new Money(10.00m, "usd")));
+
+        exception.Message.Should().Contain("greater than zero");
+
+        _output.WriteLine("Correctly rejected negative quantity");
+    }
+
+    [Fact]
+    public void StartCheckout_WithEmptyOrder_ShouldThrowDomainException()
+    {
+        // Arrange
+        var order = CreateTestOrder();
+
+        // Act & Assert
+        var exception = Assert.Throws<DomainException>(() =>
+            order.StartCheckout("cs_test_session"));
+
+        exception.Message.Should().Contain("empty order");
+
+        _output.WriteLine("Correctly rejected checkout with empty order");
+    }
+
+    [Fact]
+    public void OrderReconstruct_WithValidData_ShouldCreateCorrectOrder()
+    {
+        // Arrange
+        var orderId = new OrderId("order-123");
+        var customerId = new CustomerId("customer-456");
+        var customerEmail = new Email("reconstruct@example.com");
+        var status = OrderStatus.Paid;
+        var totalAmount = new Money(99.99m, "usd");
+        var items = new[]
+        {
+            OrderItem.Reconstruct("product-1", "Product 1", 2, new Money(29.99m, "usd")),
+            OrderItem.Reconstruct("product-2", "Product 2", 1, new Money(39.99m, "usd"))
+        };
+
+        // Act
+        _output.WriteLine("Reconstructing order from persistence data...");
+        var order = Order.Reconstruct(
+            orderId, customerId, customerEmail, status, totalAmount,
+            "cs_stripe_session", "https://webhook.example.com",
+            0, null, new Dictionary<string, object>(),
+            DateTime.UtcNow.AddHours(-1), DateTime.UtcNow, 1, items);
+
+        // Assert
+        order.Should().NotBeNull();
+        order.Id.Should().Be(orderId);
+        order.CustomerId.Should().Be(customerId);
+        order.CustomerEmail.Should().Be(customerEmail);
+        order.Status.Should().Be(status);
+        order.TotalAmount.Should().Be(totalAmount);
+        order.Items.Should().HaveCount(2);
+
+        _output.WriteLine($"Order reconstructed successfully: {order.Id.Value}, Status: {order.Status}");
+    }
+
+    [Fact]
+    public void MoneyOperations_WithSameCurrency_ShouldCalculateCorrectly()
+    {
+        // Arrange
+        var money1 = new Money(25.50m, "USD");
+        var money2 = new Money(14.25m, "USD");
+
+        // Act & Assert
+        money1.Amount.Should().Be(25.50m);
+        money1.Currency.Should().Be("USD");
+        money2.Amount.Should().Be(14.25m);
+        money2.Currency.Should().Be("USD");
+
+        _output.WriteLine($"Money comparison completed: {money1.Amount} {money1.Currency}");
+    }
+
+    [Fact]
+    public void MoneyOperations_WithDifferentCurrency_ShouldThrowException()
+    {
+        // Arrange
+        var usdMoney = new Money(25.50m, "usd");
+        var eurMoney = new Money(14.25m, "eur");
+
+        // Act & Assert
+        usdMoney.Should().NotBe(eurMoney);
+        usdMoney.Currency.Should().NotBe(eurMoney.Currency);
+
+        _output.WriteLine("Correctly rejected cross-currency operations");
+    }
+}

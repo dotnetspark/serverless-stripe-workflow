@@ -1,0 +1,14 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "T001: scaffold solution & projects",
+			"type": "shell",
+			"command": "pwsh -NoProfile -NonInteractive -Command \"$_err = $ErrorActionPreference; $ErrorActionPreference='Stop'; try { New-Item -ItemType Directory -Force frontend/blazor-client | Out-Null; New-Item -ItemType Directory -Force backend/azure-functions/src/Checkout | Out-Null; New-Item -ItemType Directory -Force backend/azure-functions/src/Webhooks | Out-Null; New-Item -ItemType Directory -Force backend/azure-functions/src/Notify | Out-Null; New-Item -ItemType Directory -Force backend/aws-lambda/src/Checkout | Out-Null; New-Item -ItemType Directory -Force backend/aws-lambda/src/Webhooks | Out-Null; New-Item -ItemType Directory -Force backend/aws-lambda/src/Notify | Out-Null; New-Item -ItemType Directory -Force backend/shared/Domain | Out-Null; New-Item -ItemType Directory -Force tests/contract | Out-Null; New-Item -ItemType Directory -Force tests/integration | Out-Null; New-Item -ItemType Directory -Force tests/unit | Out-Null; if (-not (Test-Path './serverless-stripe-workflow.sln')) { dotnet new sln -n serverless-stripe-workflow | Out-Null }; dotnet new classlib -n Domain -o backend/shared/Domain | Out-Null; dotnet new web -n CheckoutFn -o backend/azure-functions/src/Checkout | Out-Null; dotnet new web -n WebhooksFn -o backend/azure-functions/src/Webhooks | Out-Null; dotnet new web -n NotifyFn -o backend/azure-functions/src/Notify | Out-Null; dotnet new console -n CheckoutLambda -o backend/aws-lambda/src/Checkout | Out-Null; dotnet new console -n WebhooksLambda -o backend/aws-lambda/src/Webhooks | Out-Null; dotnet new console -n NotifyLambda -o backend/aws-lambda/src/Notify | Out-Null; dotnet new xunit -n ContractTests -o tests/contract | Out-Null; dotnet new xunit -n IntegrationTests -o tests/integration | Out-Null; dotnet new xunit -n UnitTests -o tests/unit | Out-Null; dotnet sln add backend/shared/Domain/Domain.csproj backend/azure-functions/src/Checkout/CheckoutFn.csproj backend/azure-functions/src/Webhooks/WebhooksFn.csproj backend/azure-functions/src/Notify/NotifyFn.csproj backend/aws-lambda/src/Checkout/CheckoutLambda.csproj backend/aws-lambda/src/Webhooks/WebhooksLambda.csproj backend/aws-lambda/src/Notify/NotifyLambda.csproj tests/contract/ContractTests.csproj tests/integration/IntegrationTests.csproj tests/unit/UnitTests.csproj | Out-Null; Write-Host 'Scaffold complete' } catch { $ErrorActionPreference=$_err; Write-Error $_; exit 1 } finally { $ErrorActionPreference=$_err }\"",
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		}
+	]
+}

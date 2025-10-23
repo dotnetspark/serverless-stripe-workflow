@@ -1,0 +1,339 @@
+using System;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using StripeWorkflow.Domain.Models;
+using StripeWorkflow.Domain.Repositories;
+using StripeWorkflow.Domain.Services;
+using StripeWorkflow.Domain.ValueObjects;
+using StripeWorkflow.Handlers;
+using StripeWorkflow.Repositories;
+using StripeWorkflow.Services;
+using Xunit.Abstractions;
+
+namespace StripeWorkflow.IntegrationTests.Infrastructure;
+
+/// <summary>
+/// Base test class that provides comprehensive test infrastructure with dependency injection,
+/// containerized databases, and mock services for integration testing.
+/// </summary>
+public abstract class IntegrationTestBase : IDisposable
+{
+    protected readonly ITestOutputHelper _output;
+    protected IServiceProvider ServiceProvider { get; private set; }
+    protected IConfiguration Configuration { get; private set; }
+    protected ILogger Logger { get; private set; }
+
+    protected IntegrationTestBase(ITestOutputHelper output)
+    {
+        _output = output;
+
+        Configuration = new ConfigurationBuilder()
+            .AddJsonFile("appsettings.test.json", optional: true)
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["ConnectionStrings:CosmosDB"] = "AccountEndpoint=https://localhost:8081/;AccountKey=C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==",
+                ["FakeStoreApi:BaseUrl"] = "https://fakestoreapi.com",
+                ["Stripe:PublishableKey"] = "pk_test_integration_testing",
+                ["Stripe:WebhookSecret"] = "whsec_test_integration",
+                ["SendGrid:ApiKey"] = "SG.test_integration_key",
+                ["B2C:TenantName"] = "test-tenant",
+                ["B2C:ClientId"] = "test-client-id"
+            })
+            .Build();
+
+        var services = new ServiceCollection();
+        ConfigureServices(services);
+        ServiceProvider = services.BuildServiceProvider();
+
+        Logger = ServiceProvider.GetRequiredService<ILogger<IntegrationTestBase>>();
+
+        _output.WriteLine($"Integration test initialized: {GetType().Name}");
+    }
+
+    protected virtual void ConfigureServices(IServiceCollection services)
+    {
+        // Configuration
+        services.AddSingleton(Configuration);
+
+        // Logging
+        services.AddLogging(builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Information);
+            builder.AddProvider(new XunitLoggerProvider(_output));
+        });
+
+        // Domain services and repositories
+        services.AddSingleton<IOrderRepository, MockOrderRepository>();
+
+        // External services (mocked for testing)
+        services.AddSingleton<IProductCatalogService, MockProductService>();
+        services.AddSingleton<INotificationService, MockNotificationService>();
+        services.AddSingleton<MockNotificationService>();
+
+        // Handlers
+        services.AddTransient<CheckoutHandler>();
+        services.AddTransient<WebhookHandler>();
+        services.AddTransient<NotificationHandler>();
+
+        // Additional test-specific services
+        ConfigureTestServices(services);
+    }
+
+    /// <summary>
+    /// Override to add test-specific service configurations
+    /// </summary>
+    protected virtual void ConfigureTestServices(IServiceCollection services)
+    {
+        // Override in derived classes for specific test configurations
+    }
+
+    /// <summary>
+    /// Creates test order data for integration tests
+    /// </summary>
+    protected static Order CreateTestOrder(string? customerId = null, string? customerEmail = null)
+    {
+        var order = Order.Create(
+            new CustomerId(customerId ?? $"customer_{DateTimeOffset.UtcNow.Ticks}"),
+            new Email(customerEmail ?? "test@example.com")
+        );
+
+        return order;
+    }
+
+    public virtual void Dispose()
+    {
+        ServiceProvider?.Dispose();
+        _output.WriteLine($"Integration test disposed: {GetType().Name}");
+    }
+}
+
+/// <summary>
+/// Custom logger provider for xUnit test output
+/// </summary>
+public class XunitLoggerProvider : ILoggerProvider
+{
+    private readonly ITestOutputHelper _output;
+
+    public XunitLoggerProvider(ITestOutputHelper output)
+    {
+        _output = output;
+    }
+
+    public ILogger CreateLogger(string categoryName)
+    {
+        return new XunitLogger(_output, categoryName);
+    }
+
+    public void Dispose() { }
+}
+
+/// <summary>
+/// Custom logger that writes to xUnit test output
+/// </summary>
+public class XunitLogger : ILogger
+{
+    private readonly ITestOutputHelper _output;
+    private readonly string _categoryName;
+
+    public XunitLogger(ITestOutputHelper output, string categoryName)
+    {
+        _output = output;
+        _categoryName = categoryName;
+    }
+
+    public IDisposable BeginScope<TState>(TState state) => null!;
+
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Information;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        if (!IsEnabled(logLevel)) return;
+
+        try
+        {
+            var message = formatter(state, exception);
+            _output.WriteLine($"[{logLevel}] {_categoryName}: {message}");
+
+            if (exception != null)
+            {
+                _output.WriteLine($"Exception: {exception}");
+            }
+        }
+        catch
+        {
+            // Ignore logging errors in tests
+        }
+    }
+}
+
+/// <summary>
+/// Mock order repository for testing
+/// </summary>
+public class MockOrderRepository : IOrderRepository
+{
+    private readonly Dictionary<string, Order> _orders = new();
+    private readonly ILogger<MockOrderRepository> _logger;
+
+    public MockOrderRepository(ILogger<MockOrderRepository> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<Order?> GetByIdAsync(string id)
+    {
+        await Task.Delay(10); // Simulate async operation
+        _orders.TryGetValue(id, out var order);
+        _logger.LogInformation($"Retrieved order {id}: {(order != null ? "Found" : "Not Found")}");
+        return order;
+    }
+
+    public async Task<Order> CreateAsync(Order order)
+    {
+        await Task.Delay(20); // Simulate async operation
+        _orders[order.Id.Value] = order;
+        _logger.LogInformation($"Created order {order.Id.Value} with status {order.Status}");
+        return order;
+    }
+
+    public async Task<Order> UpdateAsync(Order order)
+    {
+        await Task.Delay(20); // Simulate async operation
+        _orders[order.Id.Value] = order;
+        _logger.LogInformation($"Updated order {order.Id.Value} with status {order.Status}");
+        return order;
+    }
+
+    public async Task<bool> UpdateStatusAsync(string id, OrderStatus status, int expectedVersion)
+    {
+        await Task.Delay(15);
+        if (_orders.TryGetValue(id, out var order))
+        {
+            // Simulate version check and status update
+            _logger.LogInformation($"Updated order {id} status to {status}");
+            return true;
+        }
+        return false;
+    }
+
+    public async Task<IEnumerable<Order>> GetByStatusAsync(OrderStatus status)
+    {
+        await Task.Delay(15);
+        var orders = _orders.Values.Where(o => o.Status == status).ToList();
+        _logger.LogInformation($"Retrieved {orders.Count} orders with status {status}");
+        return orders;
+    }
+
+    public async Task<IEnumerable<Order>> GetPendingRetryOrdersAsync()
+    {
+        await Task.Delay(15);
+        var orders = _orders.Values.Where(o => o.Status == OrderStatus.Failed && o.FailureAttempts < 3).ToList();
+        _logger.LogInformation($"Retrieved {orders.Count} orders pending retry");
+        return orders;
+    }
+
+    public async Task<Order?> GetByStripeSessionIdAsync(string sessionId)
+    {
+        await Task.Delay(10);
+        var order = _orders.Values.FirstOrDefault(o => o.StripeSessionId == sessionId);
+        _logger.LogInformation($"Retrieved order by session {sessionId}: {(order != null ? order.Id.Value : "Not Found")}");
+        return order;
+    }
+
+
+
+    public void ClearAll()
+    {
+        var count = _orders.Count;
+        _orders.Clear();
+        _logger.LogInformation($"Cleared {count} orders from mock repository");
+    }
+}
+
+/// <summary>
+/// Mock product service for testing
+/// </summary>
+public class MockProductService : IProductCatalogService
+{
+    private readonly ILogger<MockProductService> _logger;
+    private static readonly Dictionary<string, ProductDto> _products = new()
+    {
+        ["1"] = new ProductDto { Id = "1", Title = "Test Product 1", Price = 29.99m, Category = "electronics" },
+        ["2"] = new ProductDto { Id = "2", Title = "Test Product 2", Price = 19.99m, Category = "clothing" },
+        ["3"] = new ProductDto { Id = "3", Title = "Test Product 3", Price = 39.99m, Category = "books" },
+        ["4"] = new ProductDto { Id = "4", Title = "Test Product 4", Price = 49.99m, Category = "electronics" },
+        ["5"] = new ProductDto { Id = "5", Title = "Test Product 5", Price = 15.99m, Category = "clothing" }
+    };
+
+    public MockProductService(ILogger<MockProductService> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<Product?> GetProductByIdAsync(string id)
+    {
+        await Task.Delay(50); // Simulate API call
+        _products.TryGetValue(productId, out var product);
+        _logger.LogInformation($"Retrieved product {productId}: {(product != null ? product.Title : "Not Found")}");
+        return product;
+    }
+
+    public async Task<IEnumerable<Product>> GetProductsAsync()
+    {
+        await Task.Delay(100); // Simulate API call
+        var products = _products.Values.Select(dto => new Product
+        {
+            Id = dto.Id,
+            Title = dto.Title,
+            Price = dto.Price,
+            Category = dto.Category,
+            Description = dto.Description,
+            Image = dto.Image
+        }).ToList();
+
+        _logger.LogInformation($"Retrieved {products.Count} products");
+        return products;
+    }
+
+    public async Task<IEnumerable<Product>> GetProductsByCategoryAsync(string category)
+    {
+        await Task.Delay(100); // Simulate API call
+        var products = _products.Values.AsEnumerable();
+
+        if (!string.IsNullOrEmpty(category))
+        {
+            products = products.Where(p => p.Category.Equals(category, StringComparison.OrdinalIgnoreCase));
+        }
+
+        products = products.Take(limit);
+        var result = products.ToList();
+
+        var products = _products.Values
+            .Where(p => p.Category.Equals(category, StringComparison.OrdinalIgnoreCase))
+            .Select(dto => new Product
+            {
+                Id = dto.Id,
+                Title = dto.Title,
+                Price = dto.Price,
+                Category = dto.Category,
+                Description = dto.Description,
+                Image = dto.Image
+            }).ToList();
+
+        _logger.LogInformation($"Retrieved {products.Count} products for category {category}");
+        return products;
+    }
+}
+
+/// <summary>
+/// Product DTO for testing
+/// </summary>
+public class ProductDto
+{
+    public string Id { get; set; } = string.Empty;
+    public string Title { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public string Category { get; set; } = string.Empty;
+    public string Description { get; set; } = "Test product description";
+    public string Image { get; set; } = "https://example.com/test-image.jpg";
+}

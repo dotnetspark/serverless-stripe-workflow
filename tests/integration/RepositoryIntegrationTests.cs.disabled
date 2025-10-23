@@ -1,0 +1,250 @@
+using FluentAssertions;
+using Microsoft.Extensions.Logging;
+using StripeWorkflow.Domain.Models;
+using StripeWorkflow.Domain.ValueObjects;
+using StripeWorkflow.IntegrationTests.Infrastructure;
+using StripeWorkflow.Repositories.Cosmos;
+using StripeWorkflow.Repositories.DynamoDB;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace StripeWorkflow.IntegrationTests;
+
+/// <summary>
+/// Repository integration tests that verify document mapping and persistence
+/// </summary>
+public class RepositoryIntegrationTests : IntegrationTestBase
+{
+    public RepositoryIntegrationTests(ITestOutputHelper output) : base(output)
+    {
+    }
+
+    [Fact]
+    public void CosmosOrderDocument_FromOrder_ShouldMapCorrectly()
+    {
+        // Arrange
+        var order = CreateComplexTestOrder();
+
+        // Act
+        _output.WriteLine("Testing Cosmos document mapping...");
+        var document = CosmosOrderDocument.FromOrder(order);
+
+        // Assert
+        document.Should().NotBeNull();
+        document.id.Should().Be(order.Id.Value);
+        document.customerId.Should().Be(order.CustomerId.Value);
+        document.customerEmail.Should().Be(order.CustomerEmail.Value);
+        document.status.Should().Be(order.Status.ToString());
+        document.totalAmount.Should().Be(order.TotalAmount.Amount);
+        document.currency.Should().Be(order.TotalAmount.Currency);
+        document.items.Should().HaveCount(order.Items.Count);
+
+        _output.WriteLine($"Cosmos document created: ID={document.id}, Total={document.totalAmount} {document.currency}");
+    }
+
+    [Fact]
+    public void CosmosOrderDocument_ToOrder_ShouldMapCorrectly()
+    {
+        // Arrange
+        var originalOrder = CreateComplexTestOrder();
+        var document = CosmosOrderDocument.FromOrder(originalOrder);
+
+        // Act
+        _output.WriteLine("Testing Cosmos document to domain model conversion...");
+        var reconstructedOrder = document.ToOrder();
+
+        // Assert
+        reconstructedOrder.Should().NotBeNull();
+        reconstructedOrder.Id.Value.Should().Be(originalOrder.Id.Value);
+        reconstructedOrder.CustomerId.Value.Should().Be(originalOrder.CustomerId.Value);
+        reconstructedOrder.CustomerEmail.Value.Should().Be(originalOrder.CustomerEmail.Value);
+        reconstructedOrder.Status.Should().Be(originalOrder.Status);
+        reconstructedOrder.TotalAmount.Amount.Should().Be(originalOrder.TotalAmount.Amount);
+        reconstructedOrder.TotalAmount.Currency.Should().Be(originalOrder.TotalAmount.Currency);
+        reconstructedOrder.Items.Should().HaveCount(originalOrder.Items.Count);
+
+        _output.WriteLine($"Order reconstructed: ID={reconstructedOrder.Id.Value}, Status={reconstructedOrder.Status}");
+    }
+
+    [Fact]
+    public void DynamoOrderDocument_FromOrder_ShouldMapCorrectly()
+    {
+        // Arrange
+        var order = CreateComplexTestOrder();
+
+        // Act
+        _output.WriteLine("Testing DynamoDB document mapping...");
+        var document = DynamoOrderDocument.FromOrder(order);
+
+        // Assert
+        document.Should().NotBeNull();
+        document.Id.Should().Be(order.Id.Value);
+        document.CustomerId.Should().Be(order.CustomerId.Value);
+        document.CustomerEmail.Should().Be(order.CustomerEmail.Value);
+        document.Status.Should().Be(order.Status.ToString());
+        document.TotalAmount.Should().Be(order.TotalAmount.Amount);
+        document.Currency.Should().Be(order.TotalAmount.Currency);
+        document.Items.Should().HaveCount(order.Items.Count);
+
+        // Check partition keys
+        document.PK.Should().Be($"ORDER#{order.Id.Value}");
+        document.SK.Should().Be($"ORDER#{order.Id.Value}");
+        document.GSI2PK.Should().Be($"STATUS#{order.Status}");
+
+        _output.WriteLine($"DynamoDB document created: PK={document.PK}, Total={document.TotalAmount} {document.Currency}");
+    }
+
+    [Fact]
+    public void DynamoOrderDocument_ToOrder_ShouldMapCorrectly()
+    {
+        // Arrange
+        var originalOrder = CreateComplexTestOrder();
+        var document = DynamoOrderDocument.FromOrder(originalOrder);
+
+        // Act
+        _output.WriteLine("Testing DynamoDB document to domain model conversion...");
+        var reconstructedOrder = document.ToOrder();
+
+        // Assert
+        reconstructedOrder.Should().NotBeNull();
+        reconstructedOrder.Id.Value.Should().Be(originalOrder.Id.Value);
+        reconstructedOrder.CustomerId.Value.Should().Be(originalOrder.CustomerId.Value);
+        reconstructedOrder.CustomerEmail.Value.Should().Be(originalOrder.CustomerEmail.Value);
+        reconstructedOrder.Status.Should().Be(originalOrder.Status);
+        reconstructedOrder.TotalAmount.Amount.Should().Be(originalOrder.TotalAmount.Amount);
+        reconstructedOrder.TotalAmount.Currency.Should().Be(originalOrder.TotalAmount.Currency);
+        reconstructedOrder.Items.Should().HaveCount(originalOrder.Items.Count);
+
+        _output.WriteLine($"Order reconstructed: ID={reconstructedOrder.Id.Value}, Status={reconstructedOrder.Status}");
+    }
+
+    [Fact]
+    public void OrderItemMapping_BothRepositories_ShouldPreserveData()
+    {
+        // Arrange
+        var order = CreateTestOrder();
+        order.AddItem("product-123", "Test Product", 3, new Money(45.67m, "eur"));
+        order.AddItem("product-456", "Another Product", 1, new Money(99.99m, "eur"));
+
+        // Act & Assert - Cosmos mapping
+        _output.WriteLine("Testing order item mapping for both repositories...");
+        var cosmosDoc = CosmosOrderDocument.FromOrder(order);
+        var cosmosReconstructed = cosmosDoc.ToOrder();
+
+        // Act & Assert - DynamoDB mapping  
+        var dynamoDoc = DynamoOrderDocument.FromOrder(order);
+        var dynamoReconstructed = dynamoDoc.ToOrder();
+
+        // Verify items are preserved in both cases
+        cosmosReconstructed.Items.Should().HaveCount(2);
+        dynamoReconstructed.Items.Should().HaveCount(2);
+
+        var cosmosItem = cosmosReconstructed.Items.First();
+        var dynamoItem = dynamoReconstructed.Items.First();
+
+        cosmosItem.ProductId.Should().Be("product-123");
+        cosmosItem.ProductName.Should().Be("Test Product");
+        cosmosItem.Quantity.Should().Be(3);
+        cosmosItem.UnitPrice.Amount.Should().Be(45.67m);
+        cosmosItem.UnitPrice.Currency.Should().Be("EUR");
+
+        dynamoItem.ProductId.Should().Be("product-123");
+        dynamoItem.ProductName.Should().Be("Test Product");
+        dynamoItem.Quantity.Should().Be(3);
+        dynamoItem.UnitPrice.Amount.Should().Be(45.67m);
+        dynamoItem.UnitPrice.Currency.Should().Be("EUR");
+
+        _output.WriteLine("Order items preserved correctly in both repository mappings");
+    }
+
+    [Fact]
+    public void RoundTripMapping_MultipleOperations_ShouldPreserveIntegrity()
+    {
+        // Arrange
+        var originalOrder = CreateTestOrder();
+        originalOrder.AddItem("1", "Product 1", 2, new Money(29.99m, "usd"));
+        originalOrder.StartCheckout("cs_test_session");
+        originalOrder.MarkAsPaid();
+
+        // Act - Multiple round trips
+        _output.WriteLine("Testing data integrity through multiple round-trip mappings...");
+
+        // Cosmos round trip
+        var cosmosDoc1 = CosmosOrderDocument.FromOrder(originalOrder);
+        var cosmosOrder1 = cosmosDoc1.ToOrder();
+        var cosmosDoc2 = CosmosOrderDocument.FromOrder(cosmosOrder1);
+        var cosmosOrder2 = cosmosDoc2.ToOrder();
+
+        // DynamoDB round trip
+        var dynamoDoc1 = DynamoOrderDocument.FromOrder(originalOrder);
+        var dynamoOrder1 = dynamoDoc1.ToOrder();
+        var dynamoDoc2 = DynamoOrderDocument.FromOrder(dynamoOrder1);
+        var dynamoOrder2 = dynamoDoc2.ToOrder();
+
+        // Assert - Data should be identical after multiple round trips
+        cosmosOrder2.Id.Value.Should().Be(originalOrder.Id.Value);
+        cosmosOrder2.Status.Should().Be(originalOrder.Status);
+        cosmosOrder2.TotalAmount.Amount.Should().Be(originalOrder.TotalAmount.Amount);
+
+        dynamoOrder2.Id.Value.Should().Be(originalOrder.Id.Value);
+        dynamoOrder2.Status.Should().Be(originalOrder.Status);
+        dynamoOrder2.TotalAmount.Amount.Should().Be(originalOrder.TotalAmount.Amount);
+
+        _output.WriteLine("Data integrity preserved through multiple round-trip mappings");
+    }
+
+    [Theory]
+    [InlineData(OrderStatus.Draft)]
+    [InlineData(OrderStatus.Pending)]
+    [InlineData(OrderStatus.Paid)]
+    [InlineData(OrderStatus.Fulfilled)]
+    [InlineData(OrderStatus.Failed)]
+    [InlineData(OrderStatus.Cancelled)]
+    [InlineData(OrderStatus.Refunded)]
+    public void OrderStatusMapping_AllStatuses_ShouldMapCorrectly(OrderStatus status)
+    {
+        // Arrange
+        var order = CreateTestOrder();
+        if (status != OrderStatus.Draft)
+        {
+            order.AddItem("1", "Product", 1, new Money(10.00m, "usd"));
+            if (status != OrderStatus.Draft)
+                order.StartCheckout("cs_test");
+            if (status == OrderStatus.Paid || status == OrderStatus.Fulfilled)
+                order.MarkAsPaid();
+            if (status == OrderStatus.Fulfilled)
+                order.MarkAsFulfilled();
+            if (status == OrderStatus.Failed)
+                order.MarkAsFailed("Test failure");
+        }
+
+        // Use reflection to set status for testing purposes
+        var statusField = typeof(Order).GetField("<Status>k__BackingField",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        statusField?.SetValue(order, status);
+
+        // Act & Assert
+        _output.WriteLine($"Testing status mapping for: {status}");
+
+        var cosmosDoc = CosmosOrderDocument.FromOrder(order);
+        var cosmosReconstructed = cosmosDoc.ToOrder();
+        cosmosReconstructed.Status.Should().Be(status);
+
+        var dynamoDoc = DynamoOrderDocument.FromOrder(order);
+        var dynamoReconstructed = dynamoDoc.ToOrder();
+        dynamoReconstructed.Status.Should().Be(status);
+
+        _output.WriteLine($"Status {status} mapped correctly in both repositories");
+    }
+
+    private Order CreateComplexTestOrder()
+    {
+        var order = CreateTestOrder("complex-customer", "complex@example.com");
+        order.AddItem("product-1", "Complex Product 1", 2, new Money(29.99m, "usd"));
+        order.AddItem("product-2", "Complex Product 2", 1, new Money(49.99m, "usd"));
+        order.AddItem("product-3", "Complex Product 3", 3, new Money(19.99m, "usd"));
+        order.StartCheckout("cs_complex_session_123");
+        order.MarkAsPaid();
+        return order;
+    }
+}

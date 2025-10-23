@@ -30,17 +30,20 @@ Date: 2025-10-15
 
 - Order
 
-  - orderId: string (UUID)
-  - status: enum [pending, paid, failed, canceled]
+  - orderId: string (UUID, partition key)
+  - status: enum [Draft, Pending, Paid, Fulfilled, Failed, Cancelled, Refunded]
   - amount: integer (minor units)
   - currency: string (default USD)
   - lineItems: CartItem[]
   - customerEmail: string (required)
   - customerPhone: string (optional, E.164)
-  - paymentReference: string (Stripe sessionId or paymentIntentId)
+  - paymentReference: string (Stripe sessionId)
   - createdAt: datetime (ISO8601)
   - updatedAt: datetime (ISO8601)
   - lastEventId: string (idempotency guard)
+  - version: integer (optimistic concurrency control)
+  - failureReason: string (optional, for Failed status)
+  - metadata: object (optional, for extensibility)
 
 - PaymentEvent
 
@@ -71,7 +74,11 @@ Date: 2025-10-15
 
 ## State Transitions (Order)
 
-- pending -> paid (on checkout.session.completed or payment_intent.succeeded)
-- pending -> failed (on payment_intent.payment_failed)
-- pending -> canceled (on user cancel/timeout)
-- Any -> paid is idempotent; repeat events do not duplicate notifications.
+- Draft → Pending (on checkout session creation)
+- Pending → Paid (on checkout.session.completed)
+- Pending → Cancelled (on session timeout or user cancel)
+- Paid → Fulfilled (on successful notification delivery)
+- Failed → Pending (on retry attempt, if retry count < max)
+- Cancelled → Pending (on new checkout session for same order)
+- Paid → Refunded (on refund processing, future feature)
+- Invalid transitions are rejected to maintain state consistency

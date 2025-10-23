@@ -1,0 +1,638 @@
+using System.Diagnostics;
+using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using StripeWorkflow.Domain.Models;
+using StripeWorkflow.Domain.Repositories;
+using StripeWorkflow.Domain.ValueObjects;
+using StripeWorkflow.Handlers;
+using StripeWorkflow.IntegrationTests.Infrastructure;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace StripeWorkflow.IntegrationTests;
+
+/// <summary>
+/// Performance and scalability integration tests to validate system behavior under load.
+/// </summary>
+public class PerformanceIntegrationTests : IntegrationTestBase
+{
+    private readonly CheckoutHandler _checkoutHandler;
+    private readonly WebhookHandler _webhookHandler;
+    private readonly NotificationHandler _notificationHandler;
+    private readonly IOrderRepository _orderRepository;
+
+    public PerformanceIntegrationTests(ITestOutputHelper output) : base(output)
+    {
+        _checkoutHandler = ServiceProvider.GetRequiredService<CheckoutHandler>();
+        _webhookHandler = ServiceProvider.GetRequiredService<WebhookHandler>();
+        _notificationHandler = ServiceProvider.GetRequiredService<NotificationHandler>();
+        _orderRepository = ServiceProvider.GetRequiredService<IOrderRepository>();
+    }
+
+    [Fact]
+    public async Task ConcurrentCheckouts_Under100Simultaneous_ShouldMaintainPerformance()
+    {
+        // Arrange
+        const int concurrentUsers = 100;
+        _output.WriteLine($"Testing {concurrentUsers} concurrent checkout requests...");
+
+        var semaphore = new SemaphoreSlim(concurrentUsers, concurrentUsers);
+        var successCount = 0;
+        var errorCount = 0;
+        var responseTimes = new List<long>();
+
+        var tasks = Enumerable.Range(1, concurrentUsers).Select(async i =>
+        {
+            await semaphore.WaitAsync();
+            var stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                var checkoutRequest = new CheckoutRequest
+                {
+                    CustomerId = $"perf_customer_{i}",
+                    CustomerEmail = $"perf{i}@example.com",
+                    Items = new[]
+                    {
+                        new CheckoutItemRequest { ProductId = ((i % 20) + 1).ToString(), Quantity = 1 }
+                    },
+                    Currency = "USD",
+                    SuccessUrl = "https://example.com/success",
+                    CancelUrl = "https://example.com/cancel"
+                };
+
+                var response = await _checkoutHandler.CreateCheckoutAsync(checkoutRequest);
+                stopwatch.Stop();
+
+                lock (responseTimes)
+                {
+                    responseTimes.Add(stopwatch.ElapsedMilliseconds);
+                    successCount++;
+                }
+
+                return response;
+            }
+            catch (Exception ex)
+            {
+                stopwatch.Stop();
+                lock (responseTimes)
+                {
+                    errorCount++;
+                }
+                _output.WriteLine($"Error in concurrent checkout {i}: {ex.Message}");
+                throw;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }).ToArray();
+
+        var overallStopwatch = Stopwatch.StartNew();
+
+        // Act
+        var results = await Task.WhenAll(tasks);
+        overallStopwatch.Stop();
+
+        // Assert - Performance metrics
+        results.Should().HaveCount(concurrentUsers);
+        successCount.Should().Be(concurrentUsers);
+        errorCount.Should().Be(0);
+
+        var avgResponseTime = responseTimes.Average();
+        var p95ResponseTime = responseTimes.OrderBy(x => x).Skip((int)(responseTimes.Count * 0.95)).First();
+        var p99ResponseTime = responseTimes.OrderBy(x => x).Skip((int)(responseTimes.Count * 0.99)).First();
+
+        // Performance assertions
+        avgResponseTime.Should().BeLessThan(2000, "Average response time should be under 2 seconds");
+        p95ResponseTime.Should().BeLessThan(5000, "95th percentile should be under 5 seconds");
+        p99ResponseTime.Should().BeLessThan(10000, "99th percentile should be under 10 seconds");
+
+        _output.WriteLine($"Concurrent checkouts completed in {overallStopwatch.ElapsedMilliseconds}ms");
+        _output.WriteLine($"Average response time: {avgResponseTime:F2}ms");
+        _output.WriteLine($"95th percentile: {p95ResponseTime}ms");
+        _output.WriteLine($"99th percentile: {p99ResponseTime}ms");
+        _output.WriteLine($"Success rate: {(successCount * 100.0 / concurrentUsers):F1}%");
+    }
+
+    [Fact]
+    public async Task HighThroughputWebhooks_500PerMinute_ShouldProcessWithoutBottlenecks()
+    {
+        // Arrange
+        const int webhookCount = 500;
+        _output.WriteLine($"Testing {webhookCount} webhook requests for high throughput...");
+
+        // Pre-create orders for webhooks
+        var orders = new List<Order>();
+        for (int i = 0; i < webhookCount; i++)
+        {
+            var order = Order.Create(
+                OrderId.Create($"webhook_perf_{i}"),
+                CustomerId.Create($"customer_{i}"),
+                Email.Create($"webhook{i}@example.com")
+            );
+            order.AddItem("1", "Test Product", 1, Money.Create(29.99m, "USD"));
+            order.StartCheckout($"cs_test_{i}", "https://example.com/success", "https://example.com/cancel");
+            orders.Add(order);
+            await _orderRepository.SaveAsync(order);
+        }
+
+        var processingTimes = new List<long>();
+        var successCount = 0;
+        var errorCount = 0;
+
+        // Create webhook processing tasks with controlled concurrency
+        var semaphore = new SemaphoreSlim(50, 50); // Limit to 50 concurrent webhook processes
+        var tasks = orders.Select(async (order, index) =>
+        {
+            await semaphore.WaitAsync();
+            var stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                var webhookPayload = CreateWebhookPayload("checkout.session.completed", $"cs_test_{index}", order.Id.Value);
+                var signature = GenerateTestSignature(webhookPayload);
+
+                var result = await _webhookHandler.ProcessWebhookAsync(webhookPayload, signature);
+                stopwatch.Stop();
+
+                lock (processingTimes)
+                {
+                    processingTimes.Add(stopwatch.ElapsedMilliseconds);
+                    if (result.Processed)
+                        successCount++;
+                    else
+                        errorCount++;
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                stopwatch.Stop();
+                lock (processingTimes)
+                {
+                    errorCount++;
+                }
+                _output.WriteLine($"Webhook processing error {index}: {ex.Message}");
+                throw;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }).ToArray();
+
+        var overallStopwatch = Stopwatch.StartNew();
+
+        // Act
+        var results = await Task.WhenAll(tasks);
+        overallStopwatch.Stop();
+
+        // Assert - Throughput and performance
+        results.Should().HaveCount(webhookCount);
+        successCount.Should().Be(webhookCount);
+        errorCount.Should().Be(0);
+
+        var avgProcessingTime = processingTimes.Average();
+        var throughputPerSecond = webhookCount / (overallStopwatch.ElapsedMilliseconds / 1000.0);
+
+        // Performance assertions
+        avgProcessingTime.Should().BeLessThan(1000, "Average webhook processing should be under 1 second");
+        throughputPerSecond.Should().BeGreaterThan(8, "Should handle at least 8 webhooks per second");
+
+        _output.WriteLine($"Processed {webhookCount} webhooks in {overallStopwatch.ElapsedMilliseconds}ms");
+        _output.WriteLine($"Average processing time: {avgProcessingTime:F2}ms");
+        _output.WriteLine($"Throughput: {throughputPerSecond:F1} webhooks/second");
+        _output.WriteLine($"Success rate: {(successCount * 100.0 / webhookCount):F1}%");
+    }
+
+    [Fact]
+    public async Task BulkOrderOperations_1000Orders_ShouldCompleteWithinTimeLimit()
+    {
+        // Arrange
+        const int orderCount = 1000;
+        _output.WriteLine($"Testing bulk operations with {orderCount} orders...");
+
+        var createStopwatch = Stopwatch.StartNew();
+        var orders = new List<Order>();
+
+        // Create orders in batches to avoid overwhelming the system
+        const int batchSize = 100;
+        for (int batch = 0; batch < orderCount / batchSize; batch++)
+        {
+            var batchOrders = new List<Order>();
+
+            for (int i = 0; i < batchSize; i++)
+            {
+                var orderIndex = batch * batchSize + i;
+                var order = Order.Create(
+                    new CustomerId($"bulk_customer_{orderIndex}"),
+                    new Email($"bulk{orderIndex}@example.com")
+                );
+
+                // Add random number of items (1-5)
+                var itemCount = Random.Shared.Next(1, 6);
+                for (int j = 0; j < itemCount; j++)
+                {
+                    var productId = Random.Shared.Next(1, 21).ToString();
+                    var quantity = Random.Shared.Next(1, 4);
+                    var price = (decimal)(Random.Shared.NextDouble() * 100 + 10); // $10-$110
+
+                    order.AddItem(productId, $"Product {productId}", quantity, Money.Create(price, "USD"));
+                }
+
+                batchOrders.Add(order);
+            }
+
+            // Save batch concurrently
+            var saveTasks = batchOrders.Select(_orderRepository.SaveAsync);
+            await Task.WhenAll(saveTasks);
+            orders.AddRange(batchOrders);
+
+            _output.WriteLine($"Created and saved batch {batch + 1}/{orderCount / batchSize} ({batchOrders.Count} orders)");
+        }
+
+        createStopwatch.Stop();
+
+        // Act - Perform bulk read operations
+        var readStopwatch = Stopwatch.StartNew();
+        var readTasks = orders.Select(async order =>
+        {
+            var retrievedOrder = await _orderRepository.GetByIdAsync(order.Id);
+            return retrievedOrder;
+        });
+
+        var retrievedOrders = await Task.WhenAll(readTasks);
+        readStopwatch.Stop();
+
+        // Assert - Performance and data integrity
+        retrievedOrders.Should().HaveCount(orderCount);
+        retrievedOrders.Should().AllSatisfy(order => order.Should().NotBeNull());
+
+        var createTimePerOrder = createStopwatch.ElapsedMilliseconds / (double)orderCount;
+        var readTimePerOrder = readStopwatch.ElapsedMilliseconds / (double)orderCount;
+
+        createTimePerOrder.Should().BeLessThan(100, "Order creation should average less than 100ms per order");
+        readTimePerOrder.Should().BeLessThan(50, "Order retrieval should average less than 50ms per order");
+
+        _output.WriteLine($"Bulk order creation: {createStopwatch.ElapsedMilliseconds}ms ({createTimePerOrder:F2}ms per order)");
+        _output.WriteLine($"Bulk order retrieval: {readStopwatch.ElapsedMilliseconds}ms ({readTimePerOrder:F2}ms per order)");
+
+        // Verify data integrity for sample orders
+        var sampleOrders = retrievedOrders.Take(10).ToArray();
+        foreach (var retrievedOrder in sampleOrders)
+        {
+            var originalOrder = orders.First(o => o.Id.Value == retrievedOrder!.Id.Value);
+
+            retrievedOrder!.CustomerId.Value.Should().Be(originalOrder.CustomerId.Value);
+            retrievedOrder.CustomerEmail.Value.Should().Be(originalOrder.CustomerEmail.Value);
+            retrievedOrder.Items.Should().HaveCount(originalOrder.Items.Count);
+            retrievedOrder.TotalAmount.Amount.Should().Be(originalOrder.TotalAmount.Amount);
+        }
+
+        _output.WriteLine("Data integrity verified for sample orders");
+    }
+
+    [Fact]
+    public async Task MemoryUsageUnderLoad_ExtendedOperation_ShouldRemainStable()
+    {
+        // Arrange
+        _output.WriteLine("Testing memory usage stability under extended load...");
+
+        var initialMemory = GC.GetTotalMemory(true);
+        var memorySnapshots = new List<long>();
+
+        const int iterations = 50;
+        const int ordersPerIteration = 20;
+
+        // Act - Simulate extended operations with periodic memory monitoring
+        for (int iteration = 0; iteration < iterations; iteration++)
+        {
+            // Create and process orders
+            var orders = new List<Order>();
+            for (int i = 0; i < ordersPerIteration; i++)
+            {
+                var orderIndex = iteration * ordersPerIteration + i;
+                var order = Order.Create(
+                    OrderId.Create($"memory_test_{orderIndex}"),
+                    CustomerId.Create($"customer_{orderIndex}"),
+                    Email.Create($"memory{orderIndex}@example.com")
+                );
+
+                order.AddItem("1", "Memory Test Product", 1, Money.Create(19.99m, "USD"));
+                orders.Add(order);
+                await _orderRepository.SaveAsync(order);
+            }
+
+            // Process checkout and payment simulation
+            foreach (var order in orders)
+            {
+                order.StartCheckout($"cs_memory_{order.Id.Value}", "https://example.com/success", "https://example.com/cancel");
+                order.MarkAsPaid();
+                await _orderRepository.SaveAsync(order);
+            }
+
+            // Force garbage collection and measure memory
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            var currentMemory = GC.GetTotalMemory(false);
+            memorySnapshots.Add(currentMemory);
+
+            if (iteration % 10 == 0)
+            {
+                var memoryMB = currentMemory / (1024.0 * 1024.0);
+                _output.WriteLine($"Iteration {iteration}: Memory usage = {memoryMB:F2} MB");
+            }
+        }
+
+        // Assert - Memory stability
+        var finalMemory = memorySnapshots.Last();
+        var memoryIncrease = finalMemory - initialMemory;
+        var memoryIncreaseMB = memoryIncrease / (1024.0 * 1024.0);
+
+        // Allow some memory growth but ensure it's not excessive
+        memoryIncreaseMB.Should().BeLessThan(200, "Memory increase should be less than 200MB for extended operations");
+
+        // Check for memory leaks by analyzing growth trend
+        var midpoint = memorySnapshots.Count / 2;
+        var firstHalfAvg = memorySnapshots.Take(midpoint).Average();
+        var secondHalfAvg = memorySnapshots.Skip(midpoint).Average();
+        var growthRate = (secondHalfAvg - firstHalfAvg) / firstHalfAvg;
+
+        growthRate.Should().BeLessThan(0.5, "Memory growth rate should be less than 50% between first and second half");
+
+        _output.WriteLine($"Initial memory: {initialMemory / (1024.0 * 1024.0):F2} MB");
+        _output.WriteLine($"Final memory: {finalMemory / (1024.0 * 1024.0):F2} MB");
+        _output.WriteLine($"Memory increase: {memoryIncreaseMB:F2} MB");
+        _output.WriteLine($"Growth rate: {growthRate * 100:F2}%");
+    }
+
+    [Fact]
+    public async Task DatabaseConnectionPooling_UnderHighConcurrency_ShouldNotExhaust()
+    {
+        // Arrange
+        const int concurrentConnections = 200;
+        _output.WriteLine($"Testing database connection pooling with {concurrentConnections} concurrent operations...");
+
+        var semaphore = new SemaphoreSlim(concurrentConnections, concurrentConnections);
+        var connectionTimes = new List<long>();
+        var successCount = 0;
+        var errorCount = 0;
+
+        var tasks = Enumerable.Range(1, concurrentConnections).Select(async i =>
+        {
+            await semaphore.WaitAsync();
+            var stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                // Create order (tests write connection)
+                var order = Order.Create(
+                    OrderId.Create($"conn_pool_{i}"),
+                    CustomerId.Create($"customer_{i}"),
+                    Email.Create($"conn{i}@example.com")
+                );
+                order.AddItem("1", "Connection Test Product", 1, Money.Create(15.99m, "USD"));
+
+                await _orderRepository.SaveAsync(order);
+
+                // Retrieve order (tests read connection)  
+                var retrievedOrder = await _orderRepository.GetByIdAsync(order.Id);
+
+                stopwatch.Stop();
+
+                lock (connectionTimes)
+                {
+                    connectionTimes.Add(stopwatch.ElapsedMilliseconds);
+                    if (retrievedOrder != null)
+                        successCount++;
+                    else
+                        errorCount++;
+                }
+
+                return retrievedOrder;
+            }
+            catch (Exception ex)
+            {
+                stopwatch.Stop();
+                lock (connectionTimes)
+                {
+                    errorCount++;
+                }
+                _output.WriteLine($"Connection pool error {i}: {ex.Message}");
+                throw;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }).ToArray();
+
+        var overallStopwatch = Stopwatch.StartNew();
+
+        // Act
+        var results = await Task.WhenAll(tasks);
+        overallStopwatch.Stop();
+
+        // Assert - Connection pooling effectiveness
+        results.Should().HaveCount(concurrentConnections);
+        successCount.Should().Be(concurrentConnections);
+        errorCount.Should().Be(0);
+
+        var avgConnectionTime = connectionTimes.Average();
+        var maxConnectionTime = connectionTimes.Max();
+
+        avgConnectionTime.Should().BeLessThan(2000, "Average database operation should be under 2 seconds");
+        maxConnectionTime.Should().BeLessThan(10000, "Maximum database operation should be under 10 seconds");
+
+        _output.WriteLine($"Database operations completed in {overallStopwatch.ElapsedMilliseconds}ms");
+        _output.WriteLine($"Average operation time: {avgConnectionTime:F2}ms");
+        _output.WriteLine($"Maximum operation time: {maxConnectionTime}ms");
+        _output.WriteLine($"Success rate: {(successCount * 100.0 / concurrentConnections):F1}%");
+    }
+
+    [Fact]
+    public async Task EndToEndWorkflow_UnderLoad_ShouldMaintainDataConsistency()
+    {
+        // Arrange
+        const int workflowCount = 50;
+        _output.WriteLine($"Testing end-to-end workflow consistency with {workflowCount} complete flows...");
+
+        var results = new List<WorkflowResult>();
+        var semaphore = new SemaphoreSlim(10, 10); // Limit concurrency to avoid overwhelming
+
+        var tasks = Enumerable.Range(1, workflowCount).Select(async i =>
+        {
+            await semaphore.WaitAsync();
+            var workflowStopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                var workflowId = $"e2e_workflow_{i}";
+
+                // Step 1: Create checkout
+                var checkoutRequest = new CheckoutRequest
+                {
+                    CustomerId = $"customer_{workflowId}",
+                    CustomerEmail = $"{workflowId}@example.com",
+                    Items = new[]
+                    {
+                        new CheckoutItemRequest { ProductId = "1", Quantity = 1 }
+                    },
+                    Currency = "USD",
+                    SuccessUrl = "https://example.com/success",
+                    CancelUrl = "https://example.com/cancel"
+                };
+
+                var checkoutResponse = await _checkoutHandler.CreateCheckoutAsync(checkoutRequest);
+
+                // Step 2: Verify order created
+                var pendingOrder = await _orderRepository.GetByIdAsync(OrderId.Create(checkoutResponse.OrderId));
+
+                // Step 3: Process payment webhook
+                var webhookPayload = CreateWebhookPayload("checkout.session.completed", checkoutResponse.SessionId, checkoutResponse.OrderId);
+                var webhookResult = await _webhookHandler.ProcessWebhookAsync(webhookPayload, GenerateTestSignature(webhookPayload));
+
+                // Step 4: Verify order marked as paid
+                var paidOrder = await _orderRepository.GetByIdAsync(OrderId.Create(checkoutResponse.OrderId));
+
+                // Step 5: Process notification
+                var notificationResult = await _notificationHandler.ProcessPaidOrderNotificationAsync(checkoutResponse.OrderId);
+
+                // Step 6: Verify final state
+                var finalOrder = await _orderRepository.GetByIdAsync(OrderId.Create(checkoutResponse.OrderId));
+
+                workflowStopwatch.Stop();
+
+                var result = new WorkflowResult
+                {
+                    WorkflowId = workflowId,
+                    Success = true,
+                    ElapsedMilliseconds = workflowStopwatch.ElapsedMilliseconds,
+                    CheckoutCreated = checkoutResponse != null,
+                    OrderPending = pendingOrder?.Status == OrderStatus.Pending,
+                    WebhookProcessed = webhookResult?.Processed == true,
+                    OrderPaid = paidOrder?.Status == OrderStatus.Paid,
+                    NotificationSent = notificationResult?.Success == true,
+                    OrderFulfilled = finalOrder?.Status == OrderStatus.Fulfilled
+                };
+
+                lock (results)
+                {
+                    results.Add(result);
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                workflowStopwatch.Stop();
+                var errorResult = new WorkflowResult
+                {
+                    WorkflowId = $"e2e_workflow_{i}",
+                    Success = false,
+                    ElapsedMilliseconds = workflowStopwatch.ElapsedMilliseconds,
+                    ErrorMessage = ex.Message
+                };
+
+                lock (results)
+                {
+                    results.Add(errorResult);
+                }
+
+                _output.WriteLine($"Workflow {i} failed: {ex.Message}");
+                return errorResult;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }).ToArray();
+
+        var overallStopwatch = Stopwatch.StartNew();
+
+        // Act
+        await Task.WhenAll(tasks);
+        overallStopwatch.Stop();
+
+        // Assert - Data consistency and performance
+        results.Should().HaveCount(workflowCount);
+
+        var successfulWorkflows = results.Where(r => r.Success).ToArray();
+        var failedWorkflows = results.Where(r => !r.Success).ToArray();
+
+        successfulWorkflows.Should().HaveCount(workflowCount, "All workflows should complete successfully");
+        failedWorkflows.Should().BeEmpty();
+
+        // Verify each step completed correctly for successful workflows
+        successfulWorkflows.Should().AllSatisfy(workflow =>
+        {
+            workflow.CheckoutCreated.Should().BeTrue();
+            workflow.OrderPending.Should().BeTrue();
+            workflow.WebhookProcessed.Should().BeTrue();
+            workflow.OrderPaid.Should().BeTrue();
+            workflow.NotificationSent.Should().BeTrue();
+            workflow.OrderFulfilled.Should().BeTrue();
+        });
+
+        var avgWorkflowTime = successfulWorkflows.Average(r => r.ElapsedMilliseconds);
+        var maxWorkflowTime = successfulWorkflows.Max(r => r.ElapsedMilliseconds);
+
+        avgWorkflowTime.Should().BeLessThan(5000, "Average end-to-end workflow should complete in under 5 seconds");
+        maxWorkflowTime.Should().BeLessThan(15000, "Maximum workflow time should be under 15 seconds");
+
+        _output.WriteLine($"End-to-end workflows completed in {overallStopwatch.ElapsedMilliseconds}ms");
+        _output.WriteLine($"Average workflow time: {avgWorkflowTime:F2}ms");
+        _output.WriteLine($"Maximum workflow time: {maxWorkflowTime}ms");
+        _output.WriteLine($"Success rate: {(successfulWorkflows.Length * 100.0 / workflowCount):F1}%");
+    }
+
+    #region Helper Methods and DTOs
+
+    private string CreateWebhookPayload(string eventType, string sessionId, string orderId)
+    {
+        return $$"""
+        {
+          "id": "evt_{{DateTimeOffset.UtcNow.Ticks}}",
+          "object": "event",
+          "type": "{{eventType}}",
+          "data": {
+            "object": {
+              "id": "{{sessionId}}",
+              "object": "checkout.session",
+              "payment_status": "{{(eventType == "checkout.session.completed" ? "paid" : "unpaid")}}",
+              "metadata": {
+                "orderId": "{{orderId}}"
+              }
+            }
+          }
+        }
+        """;
+    }
+
+    private string GenerateTestSignature(string payload)
+    {
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return $"t={timestamp},v1=test_signature_for_performance_testing";
+    }
+
+    private class WorkflowResult
+    {
+        public string WorkflowId { get; set; } = string.Empty;
+        public bool Success { get; set; }
+        public long ElapsedMilliseconds { get; set; }
+        public bool CheckoutCreated { get; set; }
+        public bool OrderPending { get; set; }
+        public bool WebhookProcessed { get; set; }
+        public bool OrderPaid { get; set; }
+        public bool NotificationSent { get; set; }
+        public bool OrderFulfilled { get; set; }
+        public string? ErrorMessage { get; set; }
+    }
+
+    #endregion
+}

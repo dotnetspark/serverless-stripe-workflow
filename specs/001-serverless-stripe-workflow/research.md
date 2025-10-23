@@ -4,7 +4,7 @@ Date: 2025-10-15
 
 ## Decisions
 
-- Use Stripe Checkout for MVP to minimize PCI scope and UI work; Payment Intents/Elements can be added later if needed.
+- Use Stripe Checkout for MVP to minimize PCI scope and UI work; direct session completion handling keeps the flow simple.
 - Azure Functions as primary backend; AWS Lambda as failover. Health/routing layer required (e.g., DNS health checks or API Gateway/LB failover).
 - Minimal persistence: order/payment records stored in Azure Table Storage (primary) with a migration/sync path to DynamoDB for failover.
 - Notifications: SendGrid for email (default), Twilio for SMS (opt-in). Retries with exponential backoff on transient failures.

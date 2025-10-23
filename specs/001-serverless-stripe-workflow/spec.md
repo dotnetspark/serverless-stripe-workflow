@@ -160,9 +160,18 @@ via email or SMS.
   and (3) send notifications.
 - **FR-015**: The primary deployment target MUST be Azure Functions with an
   automatic fallback path to AWS Lambda to achieve zero-downtime user experience.
--
 - **FR-016**: Failover MUST be transparent to users; routing MUST switch within
   an acceptable threshold (target <1 minute) when the primary is unhealthy.
+- **FR-017**: System MUST prioritize free and low-cost Azure services to
+  demonstrate cost-conscious architecture: Static Web Apps (FREE), Application
+  Insights free tier, Cosmos DB serverless, consumption-based Functions.
+- **FR-018**: System MUST provide comprehensive observability through structured
+  logging, distributed tracing, and real-time metrics via Application Insights
+  integration with Grafana dashboards.
+- **FR-019**: Local development MUST support one-command startup through .NET
+  Aspire orchestration including all services, databases, and observability stack.
+- **FR-020**: System MUST demonstrate enterprise-grade patterns including clean
+  architecture separation, platform portability, and infrastructure-as-code.
 
 _Ambiguities to resolve:_
 

@@ -1,0 +1,452 @@
+using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using StripeWorkflow.Domain.Models;
+using StripeWorkflow.Domain.Repositories;
+using StripeWorkflow.Domain.Services;
+using StripeWorkflow.Domain.ValueObjects;
+using StripeWorkflow.Handlers;
+using StripeWorkflow.IntegrationTests.Infrastructure;
+using StripeWorkflow.Services;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace StripeWorkflow.IntegrationTests;
+
+/// <summary>
+/// Comprehensive end-to-end checkout flow integration tests.
+/// Tests the complete flow from product selection through payment completion.
+/// </summary>
+public class CheckoutFlowIntegrationTests : IntegrationTestBase
+{
+    private readonly CheckoutHandler _checkoutHandler;
+    private readonly WebhookHandler _webhookHandler;
+    private readonly IProductCatalogService _productService;
+
+    public CheckoutFlowIntegrationTests(ITestOutputHelper output) : base(output)
+    {
+        _checkoutHandler = ServiceProvider.GetRequiredService<CheckoutHandler>();
+        _webhookHandler = ServiceProvider.GetRequiredService<WebhookHandler>();
+        _productService = ServiceProvider.GetRequiredService<IProductCatalogService>();
+    }
+
+    [Fact]
+    public async Task CompleteCheckoutFlow_WithValidProducts_ShouldCreateOrderAndProcessPayment()
+    {
+        // Arrange
+        _output.WriteLine("Starting complete checkout flow test...");
+
+        var customerId = new CustomerId($"test_customer_{DateTimeOffset.UtcNow.Ticks}");
+        var customerEmail = new Email("integration.test@example.com");
+
+        var checkoutRequest = new CheckoutRequest
+        {
+            CustomerId = customerId.Value,
+            CustomerEmail = customerEmail.Value,
+            Items = new[]
+            {
+                new CheckoutItemRequest { ProductId = "1", Quantity = 2 },
+                new CheckoutItemRequest { ProductId = "3", Quantity = 1 }
+            },
+            Currency = "USD",
+            SuccessUrl = "https://example.com/success",
+            CancelUrl = "https://example.com/cancel"
+        };
+
+        // Act - Step 1: Create checkout session
+        _output.WriteLine("Creating checkout session...");
+        var checkoutResponse = await _checkoutHandler.CreateCheckoutAsync(checkoutRequest);
+
+        // Assert - Checkout session created
+        checkoutResponse.Should().NotBeNull();
+        checkoutResponse.OrderId.Should().NotBeNullOrEmpty();
+        checkoutResponse.CheckoutUrl.Should().StartWith("https://checkout.stripe.com");
+        checkoutResponse.TotalAmount.Should().NotBeNull();
+        checkoutResponse.TotalAmount.Amount.Should().BeGreaterThan(0);
+        checkoutResponse.Items.Should().HaveCount(2);
+
+        _output.WriteLine($"Checkout session created: OrderId={checkoutResponse.OrderId}, Total={checkoutResponse.TotalAmount.Amount} {checkoutResponse.TotalAmount.Currency}");
+
+        // Act - Step 2: Verify order was created in database
+        var createdOrder = await GetOrderFromRepository(checkoutResponse.OrderId);
+
+        // Assert - Order exists and has correct data
+        createdOrder.Should().NotBeNull();
+        createdOrder.Id.Value.Should().Be(checkoutResponse.OrderId);
+        createdOrder.CustomerId.Value.Should().Be(customerId.Value);
+        createdOrder.CustomerEmail.Value.Should().Be(customerEmail.Value);
+        createdOrder.Status.Should().Be(OrderStatus.Pending);
+        createdOrder.Items.Should().HaveCount(2);
+        createdOrder.TotalAmount.Amount.Should().Be(checkoutResponse.TotalAmount.Amount);
+        createdOrder.TotalAmount.Currency.Should().Be(checkoutResponse.TotalAmount.Currency);
+
+        // Act - Step 3: Simulate successful payment webhook
+        _output.WriteLine("Simulating Stripe webhook for successful payment...");
+        var webhookPayload = CreateStripeWebhookPayload("checkout.session.completed", checkoutResponse.SessionId, checkoutResponse.OrderId);
+        var webhookResult = await _webhookHandler.ProcessWebhookAsync(webhookPayload, GenerateStripeSignature(webhookPayload));
+
+        // Assert - Webhook processed successfully
+        webhookResult.Should().NotBeNull();
+        webhookResult.Processed.Should().BeTrue();
+
+        // Act - Step 4: Verify order status updated to Paid
+        var paidOrder = await GetOrderFromRepository(checkoutResponse.OrderId);
+
+        // Assert - Order marked as paid
+        paidOrder.Should().NotBeNull();
+        paidOrder.Status.Should().Be(OrderStatus.Paid);
+        paidOrder.PaidAt.Should().NotBeNull();
+        paidOrder.PaidAt.Value.Should().BeCloseTo(DateTimeOffset.UtcNow, TimeSpan.FromMinutes(1));
+
+        _output.WriteLine($"Checkout flow completed successfully: Order {checkoutResponse.OrderId} is now {paidOrder.Status}");
+    }
+
+    [Fact]
+    public async Task CheckoutFlow_WithInvalidProduct_ShouldReturnError()
+    {
+        // Arrange
+        _output.WriteLine("Testing checkout flow with invalid product...");
+
+        var customerId = CustomerId.Create($"test_customer_{DateTimeOffset.UtcNow.Ticks}");
+        var checkoutRequest = new CheckoutRequest
+        {
+            CustomerId = customerId.Value,
+            CustomerEmail = "test@example.com",
+            Items = new[]
+            {
+                new CheckoutItemRequest { ProductId = "999", Quantity = 1 } // Invalid product ID
+            },
+            Currency = "USD",
+            SuccessUrl = "https://example.com/success",
+            CancelUrl = "https://example.com/cancel"
+        };
+
+        // Act & Assert
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => _checkoutHandler.CreateCheckoutAsync(checkoutRequest));
+
+        exception.Message.Should().Contain("Product not found");
+        _output.WriteLine($"Correctly rejected invalid product: {exception.Message}");
+    }
+
+    [Fact]
+    public async Task CheckoutFlow_WithZeroQuantity_ShouldReturnError()
+    {
+        // Arrange
+        _output.WriteLine("Testing checkout flow with zero quantity...");
+
+        var customerId = CustomerId.Create($"test_customer_{DateTimeOffset.UtcNow.Ticks}");
+        var checkoutRequest = new CheckoutRequest
+        {
+            CustomerId = customerId.Value,
+            CustomerEmail = "test@example.com",
+            Items = new[]
+            {
+                new CheckoutItemRequest { ProductId = "1", Quantity = 0 }
+            },
+            Currency = "USD",
+            SuccessUrl = "https://example.com/success",
+            CancelUrl = "https://example.com/cancel"
+        };
+
+        // Act & Assert
+        var exception = await Assert.ThrowsAsync<ArgumentException>(
+            () => _checkoutHandler.CreateCheckoutAsync(checkoutRequest));
+
+        exception.Message.Should().Contain("Quantity must be greater than 0");
+        _output.WriteLine($"Correctly rejected zero quantity: {exception.Message}");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("invalid-email")]
+    [InlineData("test@")]
+    [InlineData("@example.com")]
+    public async Task CheckoutFlow_WithInvalidEmail_ShouldReturnError(string invalidEmail)
+    {
+        // Arrange
+        _output.WriteLine($"Testing checkout flow with invalid email: {invalidEmail}");
+
+        var customerId = CustomerId.Create($"test_customer_{DateTimeOffset.UtcNow.Ticks}");
+        var checkoutRequest = new CheckoutRequest
+        {
+            CustomerId = customerId.Value,
+            CustomerEmail = invalidEmail,
+            Items = new[]
+            {
+                new CheckoutItemRequest { ProductId = "1", Quantity = 1 }
+            },
+            Currency = "USD",
+            SuccessUrl = "https://example.com/success",
+            CancelUrl = "https://example.com/cancel"
+        };
+
+        // Act & Assert
+        var exception = await Assert.ThrowsAsync<ArgumentException>(
+            () => _checkoutHandler.CreateCheckoutAsync(checkoutRequest));
+
+        exception.Message.Should().Contain("Invalid email format");
+        _output.WriteLine($"Correctly rejected invalid email: {exception.Message}");
+    }
+
+    [Fact]
+    public async Task CheckoutFlow_WithExpiredSession_ShouldHandleGracefully()
+    {
+        // Arrange
+        _output.WriteLine("Testing webhook processing for expired session...");
+
+        var orderId = $"order_{DateTimeOffset.UtcNow.Ticks}";
+        var sessionId = $"cs_test_expired_{DateTimeOffset.UtcNow.Ticks}";
+
+        // Create an order first
+        var order = Order.Create(
+            OrderId.Create(orderId),
+            CustomerId.Create("test_customer"),
+            Email.Create("test@example.com")
+        );
+        order.AddItem("1", "Test Product", 1, Money.Create(29.99m, "USD"));
+        order.StartCheckout(sessionId, "https://example.com/success", "https://example.com/cancel");
+
+        await SaveOrderToRepository(order);
+
+        // Act - Simulate expired session webhook
+        var webhookPayload = CreateStripeWebhookPayload("checkout.session.expired", sessionId, orderId);
+        var webhookResult = await _webhookHandler.ProcessWebhookAsync(webhookPayload, GenerateStripeSignature(webhookPayload));
+
+        // Assert
+        webhookResult.Should().NotBeNull();
+        webhookResult.Processed.Should().BeTrue();
+
+        // Verify order status
+        var expiredOrder = await GetOrderFromRepository(orderId);
+        expiredOrder.Status.Should().Be(OrderStatus.Failed);
+
+        _output.WriteLine($"Successfully handled expired session for order {orderId}");
+    }
+
+    [Fact]
+    public async Task ConcurrentCheckouts_WithSameCustomer_ShouldAllSucceed()
+    {
+        // Arrange
+        _output.WriteLine("Testing concurrent checkouts for same customer...");
+
+        var customerId = CustomerId.Create($"test_customer_{DateTimeOffset.UtcNow.Ticks}");
+        var customerEmail = Email.Create("concurrent.test@example.com");
+
+        var checkoutTasks = Enumerable.Range(1, 5).Select(async i =>
+        {
+            var checkoutRequest = new CheckoutRequest
+            {
+                CustomerId = customerId.Value,
+                CustomerEmail = customerEmail.Value,
+                Items = new[]
+                {
+                    new CheckoutItemRequest { ProductId = "1", Quantity = i }
+                },
+                Currency = "USD",
+                SuccessUrl = "https://example.com/success",
+                CancelUrl = "https://example.com/cancel"
+            };
+
+            return await _checkoutHandler.CreateCheckoutAsync(checkoutRequest);
+        }).ToArray();
+
+        // Act
+        var checkoutResponses = await Task.WhenAll(checkoutTasks);
+
+        // Assert
+        checkoutResponses.Should().HaveCount(5);
+        checkoutResponses.Should().AllSatisfy(response =>
+        {
+            response.Should().NotBeNull();
+            response.OrderId.Should().NotBeNullOrEmpty();
+            response.CheckoutUrl.Should().StartWith("https://checkout.stripe.com");
+        });
+
+        // Verify all orders are unique
+        var orderIds = checkoutResponses.Select(r => r.OrderId).ToList();
+        orderIds.Should().OnlyHaveUniqueItems();
+
+        _output.WriteLine($"Successfully created {checkoutResponses.Length} concurrent checkout sessions");
+    }
+
+    [Fact]
+    public async Task CheckoutFlow_WithMultipleCurrencies_ShouldHandleCorrectly()
+    {
+        // Arrange
+        _output.WriteLine("Testing checkout flow with multiple currencies...");
+
+        var currencies = new[] { "USD", "EUR", "GBP" };
+        var results = new List<CheckoutResponse>();
+
+        foreach (var currency in currencies)
+        {
+            var customerId = CustomerId.Create($"test_customer_{currency}_{DateTimeOffset.UtcNow.Ticks}");
+            var checkoutRequest = new CheckoutRequest
+            {
+                CustomerId = customerId.Value,
+                CustomerEmail = $"test.{currency.ToLower()}@example.com",
+                Items = new[]
+                {
+                    new CheckoutItemRequest { ProductId = "1", Quantity = 1 }
+                },
+                Currency = currency,
+                SuccessUrl = "https://example.com/success",
+                CancelUrl = "https://example.com/cancel"
+            };
+
+            // Act
+            var response = await _checkoutHandler.CreateCheckoutAsync(checkoutRequest);
+            results.Add(response);
+
+            // Assert
+            response.TotalAmount.Currency.Should().Be(currency);
+            _output.WriteLine($"Created checkout in {currency}: {response.TotalAmount.Amount} {response.TotalAmount.Currency}");
+        }
+
+        results.Should().HaveCount(3);
+        results.Select(r => r.TotalAmount.Currency).Should().BeEquivalentTo(currencies);
+    }
+
+    [Fact]
+    public async Task CheckoutFlow_WithLargeOrder_ShouldHandleEfficiently()
+    {
+        // Arrange - Create order with many items
+        _output.WriteLine("Testing checkout flow with large order (50 items)...");
+
+        var customerId = CustomerId.Create($"test_customer_large_{DateTimeOffset.UtcNow.Ticks}");
+        var items = Enumerable.Range(1, 50).Select(i => new CheckoutItemRequest
+        {
+            ProductId = ((i % 20) + 1).ToString(), // Cycle through product IDs 1-20
+            Quantity = 1
+        }).ToArray();
+
+        var checkoutRequest = new CheckoutRequest
+        {
+            CustomerId = customerId.Value,
+            CustomerEmail = "large.order@example.com",
+            Items = items,
+            Currency = "USD",
+            SuccessUrl = "https://example.com/success",
+            CancelUrl = "https://example.com/cancel"
+        };
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        // Act
+        var response = await _checkoutHandler.CreateCheckoutAsync(checkoutRequest);
+        stopwatch.Stop();
+
+        // Assert
+        response.Should().NotBeNull();
+        response.Items.Should().HaveCount(50);
+        response.TotalAmount.Amount.Should().BeGreaterThan(0);
+
+        // Performance assertion - should complete within reasonable time
+        stopwatch.ElapsedMilliseconds.Should().BeLessThan(5000, "Large orders should be processed within 5 seconds");
+
+        _output.WriteLine($"Large order processed in {stopwatch.ElapsedMilliseconds}ms with total {response.TotalAmount.Amount} {response.TotalAmount.Currency}");
+    }
+
+    #region Helper Methods
+
+    private async Task<Order?> GetOrderFromRepository(string orderId)
+    {
+        var cosmosRepository = ServiceProvider.GetRequiredService<IOrderRepository>();
+        return await cosmosRepository.GetByIdAsync(OrderId.Create(orderId));
+    }
+
+    private async Task SaveOrderToRepository(Order order)
+    {
+        var cosmosRepository = ServiceProvider.GetRequiredService<IOrderRepository>();
+        await cosmosRepository.SaveAsync(order);
+    }
+
+    private string CreateStripeWebhookPayload(string eventType, string sessionId, string orderId)
+    {
+        return $$"""
+        {
+          "id": "evt_{{DateTimeOffset.UtcNow.Ticks}}",
+          "object": "event",
+          "api_version": "2020-08-27",
+          "created": {{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}},
+          "data": {
+            "object": {
+              "id": "{{sessionId}}",
+              "object": "checkout.session",
+              "payment_status": "{{(eventType == "checkout.session.completed" ? "paid" : "unpaid")}}",
+              "customer_email": "test@example.com",
+              "metadata": {
+                "orderId": "{{orderId}}"
+              }
+            }
+          },
+          "livemode": false,
+          "pending_webhooks": 1,
+          "request": {
+            "id": null,
+            "idempotency_key": null
+          },
+          "type": "{{eventType}}"
+        }
+        """;
+    }
+
+    private string GenerateStripeSignature(string payload)
+    {
+        // For testing, return a mock signature
+        // In real implementation, this would use the webhook secret to generate HMAC
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return $"t={timestamp},v1=mock_signature_for_testing";
+    }
+
+    #endregion
+}
+
+// Request/Response DTOs for checkout handler
+public class CheckoutRequest
+{
+    public string CustomerId { get; set; } = string.Empty;
+    public string CustomerEmail { get; set; } = string.Empty;
+    public CheckoutItemRequest[] Items { get; set; } = Array.Empty<CheckoutItemRequest>();
+    public string Currency { get; set; } = "USD";
+    public string SuccessUrl { get; set; } = string.Empty;
+    public string CancelUrl { get; set; } = string.Empty;
+}
+
+public class CheckoutItemRequest
+{
+    public string ProductId { get; set; } = string.Empty;
+    public int Quantity { get; set; }
+}
+
+public class CheckoutResponse
+{
+    public string OrderId { get; set; } = string.Empty;
+    public string SessionId { get; set; } = string.Empty;
+    public string CheckoutUrl { get; set; } = string.Empty;
+    public MoneyDto TotalAmount { get; set; } = new();
+    public CheckoutItemResponse[] Items { get; set; } = Array.Empty<CheckoutItemResponse>();
+}
+
+public class CheckoutItemResponse
+{
+    public string ProductId { get; set; } = string.Empty;
+    public string ProductName { get; set; } = string.Empty;
+    public int Quantity { get; set; }
+    public MoneyDto UnitPrice { get; set; } = new();
+    public MoneyDto TotalPrice { get; set; } = new();
+}
+
+public class MoneyDto
+{
+    public decimal Amount { get; set; }
+    public string Currency { get; set; } = string.Empty;
+}
+
+public class WebhookResult
+{
+    public bool Processed { get; set; }
+    public string? OrderId { get; set; }
+    public string? Message { get; set; }
+}

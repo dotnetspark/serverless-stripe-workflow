@@ -1,0 +1,534 @@
+using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using StripeWorkflow.Domain.Models;
+using StripeWorkflow.Domain.Repositories;
+using StripeWorkflow.Domain.Services;
+using StripeWorkflow.Domain.ValueObjects;
+using StripeWorkflow.Handlers;
+using StripeWorkflow.IntegrationTests.Infrastructure;
+using StripeWorkflow.Services;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace StripeWorkflow.IntegrationTests;
+
+/// <summary>
+/// Integration tests for notification flow including email delivery, retry mechanisms, and order state transitions.
+/// </summary>
+public class NotificationFlowIntegrationTests : IntegrationTestBase
+{
+    private readonly NotificationHandler _notificationHandler;
+    private readonly INotificationService _notificationService;
+    private readonly IOrderRepository _orderRepository;
+
+    public NotificationFlowIntegrationTests(ITestOutputHelper output) : base(output)
+    {
+        _notificationHandler = ServiceProvider.GetRequiredService<NotificationHandler>();
+        _notificationService = ServiceProvider.GetRequiredService<INotificationService>();
+        _orderRepository = ServiceProvider.GetRequiredService<IOrderRepository>();
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithPaidOrder_ShouldSendEmailAndMarkFulfilled()
+    {
+        // Arrange
+        _output.WriteLine("Testing notification flow for paid order...");
+
+        var order = await CreateTestPaidOrder();
+        await _orderRepository.SaveAsync(order);
+
+        _output.WriteLine($"Created paid order: {order.Id.Value}");
+
+        // Act - Process notification
+        var result = await _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value);
+
+        // Assert - Notification processed successfully
+        result.Should().NotBeNull();
+        result.Success.Should().BeTrue();
+        result.EmailSent.Should().BeTrue();
+        result.OrderFulfilled.Should().BeTrue();
+
+        // Verify order status updated to Fulfilled
+        var fulfilledOrder = await _orderRepository.GetByIdAsync(order.Id);
+        fulfilledOrder.Should().NotBeNull();
+        fulfilledOrder!.Status.Should().Be(OrderStatus.Fulfilled);
+        fulfilledOrder.FulfilledAt.Should().NotBeNull();
+        fulfilledOrder.FulfilledAt!.Value.Should().BeCloseTo(DateTimeOffset.UtcNow, TimeSpan.FromMinutes(1));
+
+        _output.WriteLine($"Order {order.Id.Value} successfully fulfilled with notification sent");
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithEmailDeliveryFailure_ShouldRetryAndUpdateStatus()
+    {
+        // Arrange
+        _output.WriteLine("Testing notification retry mechanism...");
+
+        var order = await CreateTestPaidOrder();
+        await _orderRepository.SaveAsync(order);
+
+        // Configure notification service to fail first attempts
+        var mockNotificationService = ServiceProvider.GetRequiredService<MockNotificationService>();
+        mockNotificationService.ConfigureFailures(2); // Fail first 2 attempts, succeed on 3rd
+
+        _output.WriteLine($"Created paid order with email failure simulation: {order.Id.Value}");
+
+        // Act - Process notification (should retry automatically)
+        var result = await _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value);
+
+        // Assert - Eventually succeeded after retries
+        result.Should().NotBeNull();
+        result.Success.Should().BeTrue();
+        result.EmailSent.Should().BeTrue();
+        result.RetryCount.Should().Be(2);
+        result.OrderFulfilled.Should().BeTrue();
+
+        // Verify order is still fulfilled despite initial failures
+        var fulfilledOrder = await _orderRepository.GetByIdAsync(order.Id);
+        fulfilledOrder.Should().NotBeNull();
+        fulfilledOrder!.Status.Should().Be(OrderStatus.Fulfilled);
+
+        _output.WriteLine($"Order {order.Id.Value} fulfilled after {result.RetryCount} retries");
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithPermanentEmailFailure_ShouldNotMarkFulfilled()
+    {
+        // Arrange
+        _output.WriteLine("Testing notification with permanent email failure...");
+
+        var order = await CreateTestPaidOrder();
+        await _orderRepository.SaveAsync(order);
+
+        // Configure notification service to always fail
+        var mockNotificationService = ServiceProvider.GetRequiredService<MockNotificationService>();
+        mockNotificationService.ConfigurePermanentFailure();
+
+        _output.WriteLine($"Created paid order with permanent email failure: {order.Id.Value}");
+
+        // Act - Process notification
+        var result = await _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value);
+
+        // Assert - Failed after all retries
+        result.Should().NotBeNull();
+        result.Success.Should().BeFalse();
+        result.EmailSent.Should().BeFalse();
+        result.OrderFulfilled.Should().BeFalse();
+        result.RetryCount.Should().BeGreaterThan(0);
+
+        // Verify order remains in Paid status (not Fulfilled)
+        var remainingOrder = await _orderRepository.GetByIdAsync(order.Id);
+        remainingOrder.Should().NotBeNull();
+        remainingOrder!.Status.Should().Be(OrderStatus.Paid);
+        remainingOrder.FulfilledAt.Should().BeNull();
+
+        _output.WriteLine($"Order {order.Id.Value} remained in Paid status after {result.RetryCount} failed retry attempts");
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithNonExistentOrder_ShouldReturnError()
+    {
+        // Arrange
+        var nonExistentOrderId = $"order_nonexistent_{DateTimeOffset.UtcNow.Ticks}";
+        _output.WriteLine($"Testing notification for non-existent order: {nonExistentOrderId}");
+
+        // Act & Assert
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => _notificationHandler.ProcessPaidOrderNotificationAsync(nonExistentOrderId));
+
+        exception.Message.Should().Contain("Order not found");
+        _output.WriteLine($"Correctly rejected non-existent order: {exception.Message}");
+    }
+
+    [Theory]
+    [InlineData(OrderStatus.Draft)]
+    [InlineData(OrderStatus.Pending)]
+    [InlineData(OrderStatus.Failed)]
+    [InlineData(OrderStatus.Cancelled)]
+    public async Task NotificationFlow_WithInvalidOrderStatus_ShouldReturnError(OrderStatus invalidStatus)
+    {
+        // Arrange
+        _output.WriteLine($"Testing notification for order with invalid status: {invalidStatus}");
+
+        var order = await CreateTestOrderWithStatus(invalidStatus);
+        await _orderRepository.SaveAsync(order);
+
+        // Act & Assert
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value));
+
+        exception.Message.Should().Contain("Order is not in Paid status");
+        _output.WriteLine($"Correctly rejected order with status {invalidStatus}: {exception.Message}");
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithAlreadyFulfilledOrder_ShouldSkipProcessing()
+    {
+        // Arrange
+        _output.WriteLine("Testing notification for already fulfilled order...");
+
+        var order = await CreateTestFulfilledOrder();
+        await _orderRepository.SaveAsync(order);
+
+        _output.WriteLine($"Created already fulfilled order: {order.Id.Value}");
+
+        // Act
+        var result = await _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value);
+
+        // Assert - Should skip processing but return success
+        result.Should().NotBeNull();
+        result.Success.Should().BeTrue();
+        result.EmailSent.Should().BeFalse();
+        result.OrderFulfilled.Should().BeFalse();
+        result.Message.Should().Contain("already fulfilled");
+
+        _output.WriteLine($"Correctly skipped processing for already fulfilled order: {result.Message}");
+    }
+
+    [Fact]
+    public async Task BulkNotificationProcessing_WithMultiplePaidOrders_ShouldProcessAllSuccessfully()
+    {
+        // Arrange
+        _output.WriteLine("Testing bulk notification processing...");
+
+        var orders = new List<Order>();
+        for (int i = 0; i < 10; i++)
+        {
+            var order = await CreateTestPaidOrder($"bulk_test_{i}");
+            orders.Add(order);
+            await _orderRepository.SaveAsync(order);
+        }
+
+        var orderIds = orders.Select(o => o.Id.Value).ToArray();
+        _output.WriteLine($"Created {orders.Count} paid orders for bulk processing");
+
+        // Act - Process all notifications concurrently
+        var processingTasks = orderIds.Select(_notificationHandler.ProcessPaidOrderNotificationAsync);
+        var results = await Task.WhenAll(processingTasks);
+
+        // Assert - All processed successfully
+        results.Should().HaveCount(10);
+        results.Should().AllSatisfy(result =>
+        {
+            result.Success.Should().BeTrue();
+            result.EmailSent.Should().BeTrue();
+            result.OrderFulfilled.Should().BeTrue();
+        });
+
+        // Verify all orders are fulfilled
+        foreach (var orderId in orderIds)
+        {
+            var fulfilledOrder = await _orderRepository.GetByIdAsync(OrderId.Create(orderId));
+            fulfilledOrder!.Status.Should().Be(OrderStatus.Fulfilled);
+        }
+
+        _output.WriteLine($"Successfully processed {results.Length} notifications in bulk");
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithCustomEmailTemplate_ShouldUseCorrectTemplate()
+    {
+        // Arrange
+        _output.WriteLine("Testing notification with custom email template...");
+
+        var order = await CreateTestPaidOrderWithMultipleItems();
+        await _orderRepository.SaveAsync(order);
+
+        var mockNotificationService = ServiceProvider.GetRequiredService<MockNotificationService>();
+        mockNotificationService.EnableTemplateValidation();
+
+        _output.WriteLine($"Created order with multiple items for template testing: {order.Id.Value}");
+
+        // Act
+        var result = await _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value);
+
+        // Assert
+        result.Should().NotBeNull();
+        result.Success.Should().BeTrue();
+        result.EmailSent.Should().BeTrue();
+
+        // Verify correct template was used
+        var sentEmails = mockNotificationService.GetSentEmails();
+        sentEmails.Should().HaveCount(1);
+
+        var sentEmail = sentEmails.First();
+        sentEmail.TemplateId.Should().Be("order-confirmation");
+        sentEmail.ToEmail.Should().Be(order.CustomerEmail.Value);
+        sentEmail.Data.Should().ContainKey("orderId");
+        sentEmail.Data.Should().ContainKey("totalAmount");
+        sentEmail.Data.Should().ContainKey("items");
+
+        _output.WriteLine($"Verified correct email template used for order {order.Id.Value}");
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithHighThroughput_ShouldMaintainPerformance()
+    {
+        // Arrange
+        _output.WriteLine("Testing notification performance under high throughput...");
+
+        const int orderCount = 100;
+        var orders = new List<Order>();
+
+        for (int i = 0; i < orderCount; i++)
+        {
+            var order = await CreateTestPaidOrder($"perf_test_{i}");
+            orders.Add(order);
+            await _orderRepository.SaveAsync(order);
+        }
+
+        _output.WriteLine($"Created {orderCount} orders for performance testing");
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        // Act - Process all notifications with controlled concurrency
+        var semaphore = new SemaphoreSlim(10, 10); // Limit to 10 concurrent operations
+        var processingTasks = orders.Select(async order =>
+        {
+            await semaphore.WaitAsync();
+            try
+            {
+                return await _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value);
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        });
+
+        var results = await Task.WhenAll(processingTasks);
+        stopwatch.Stop();
+
+        // Assert - Performance and success metrics
+        results.Should().HaveCount(orderCount);
+        results.Should().AllSatisfy(result => result.Success.Should().BeTrue());
+
+        var processingTimePerOrder = stopwatch.ElapsedMilliseconds / (double)orderCount;
+        processingTimePerOrder.Should().BeLessThan(500, "Each notification should process in less than 500ms on average");
+
+        _output.WriteLine($"Processed {orderCount} notifications in {stopwatch.ElapsedMilliseconds}ms ({processingTimePerOrder:F2}ms per order)");
+    }
+
+    [Fact]
+    public async Task NotificationFlow_WithDifferentCurrencies_ShouldFormatCorrectly()
+    {
+        // Arrange
+        _output.WriteLine("Testing notification formatting with different currencies...");
+
+        var currencies = new[] { "USD", "EUR", "GBP", "JPY" };
+        var orders = new List<Order>();
+
+        foreach (var currency in currencies)
+        {
+            var order = await CreateTestPaidOrderWithCurrency(currency);
+            orders.Add(order);
+            await _orderRepository.SaveAsync(order);
+        }
+
+        var mockNotificationService = ServiceProvider.GetRequiredService<MockNotificationService>();
+        mockNotificationService.EnableTemplateValidation();
+
+        // Act - Process notifications for all currencies
+        var results = new List<NotificationResult>();
+        foreach (var order in orders)
+        {
+            var result = await _notificationHandler.ProcessPaidOrderNotificationAsync(order.Id.Value);
+            results.Add(result);
+        }
+
+        // Assert
+        results.Should().AllSatisfy(result => result.Success.Should().BeTrue());
+
+        // Verify currency formatting in sent emails
+        var sentEmails = mockNotificationService.GetSentEmails();
+        sentEmails.Should().HaveCount(currencies.Length);
+
+        for (int i = 0; i < currencies.Length; i++)
+        {
+            var email = sentEmails[i];
+            var expectedCurrency = currencies[i];
+            email.Data["totalAmount"].Should().Contain(expectedCurrency);
+
+            _output.WriteLine($"Verified currency formatting for {expectedCurrency}: {email.Data["totalAmount"]}");
+        }
+    }
+
+    #region Helper Methods
+
+    private async Task<Order> CreateTestPaidOrder(string? suffix = null)
+    {
+        var orderId = $"order_paid_{suffix ?? DateTimeOffset.UtcNow.Ticks}";
+        var customerId = $"customer_{suffix ?? DateTimeOffset.UtcNow.Ticks}";
+
+        var order = Order.Create(
+            new CustomerId(customerId),
+            new Email("test@example.com")
+        );
+
+        order.AddItem("1", "Test Product", 2, Money.Create(29.99m, "USD"));
+        order.StartCheckout("cs_test_123", "https://example.com/success", "https://example.com/cancel");
+        order.MarkAsPaid();
+
+        return order;
+    }
+
+    private async Task<Order> CreateTestOrderWithStatus(OrderStatus status)
+    {
+        var orderId = $"order_{status}_{DateTimeOffset.UtcNow.Ticks}";
+        var order = Order.Create(
+            new CustomerId($"customer_{DateTimeOffset.UtcNow.Ticks}"),
+            new Email("test@example.com")
+        );
+
+        order.AddItem("1", "Test Product", 1, Money.Create(29.99m, "USD"));
+
+        if (status != OrderStatus.Draft)
+        {
+            order.StartCheckout("cs_test_123", "https://example.com/success", "https://example.com/cancel");
+
+            if (status == OrderStatus.Paid || status == OrderStatus.Fulfilled)
+            {
+                order.MarkAsPaid();
+
+                if (status == OrderStatus.Fulfilled)
+                {
+                    order.MarkAsFulfilled();
+                }
+            }
+            else if (status == OrderStatus.Failed)
+            {
+                order.MarkAsFailed("Test failure");
+            }
+            else if (status == OrderStatus.Cancelled)
+            {
+                order.Cancel("Test cancellation");
+            }
+        }
+
+        return order;
+    }
+
+    private async Task<Order> CreateTestFulfilledOrder()
+    {
+        var order = await CreateTestPaidOrder("fulfilled");
+        order.MarkAsFulfilled();
+        return order;
+    }
+
+    private async Task<Order> CreateTestPaidOrderWithMultipleItems()
+    {
+        var order = await CreateTestPaidOrder("multi_items");
+        order.AddItem("2", "Second Product", 1, Money.Create(19.99m, "USD"));
+        order.AddItem("3", "Third Product", 3, Money.Create(9.99m, "USD"));
+        return order;
+    }
+
+    private async Task<Order> CreateTestPaidOrderWithCurrency(string currency)
+    {
+        var orderId = $"order_{currency}_{DateTimeOffset.UtcNow.Ticks}";
+        var order = Order.Create(
+            new CustomerId($"customer_{currency}"),
+            new Email($"test.{currency.ToLower()}@example.com")
+        );
+
+        var amount = currency switch
+        {
+            "JPY" => 2999m, // Japanese Yen (no decimal places)
+            "USD" => 29.99m,
+            "EUR" => 24.99m,
+            "GBP" => 21.99m,
+            _ => 29.99m
+        };
+
+        order.AddItem("1", "Test Product", 1, Money.Create(amount, currency));
+        order.StartCheckout("cs_test_123", "https://example.com/success", "https://example.com/cancel");
+        order.MarkAsPaid();
+
+        return order;
+    }
+
+    #endregion
+}
+
+// DTOs for notification handling
+public class NotificationResult
+{
+    public bool Success { get; set; }
+    public bool EmailSent { get; set; }
+    public bool OrderFulfilled { get; set; }
+    public int RetryCount { get; set; }
+    public string? Message { get; set; }
+}
+
+// Mock notification service for testing
+public class MockNotificationService : INotificationService
+{
+    private readonly List<SentEmail> _sentEmails = new();
+    private int _failureCount;
+    private bool _permanentFailure;
+    private bool _templateValidationEnabled;
+
+    public void ConfigureFailures(int failureCount)
+    {
+        _failureCount = failureCount;
+        _permanentFailure = false;
+    }
+
+    public void ConfigurePermanentFailure()
+    {
+        _permanentFailure = true;
+        _failureCount = int.MaxValue;
+    }
+
+    public void EnableTemplateValidation()
+    {
+        _templateValidationEnabled = true;
+    }
+
+    public IReadOnlyList<SentEmail> GetSentEmails() => _sentEmails;
+
+    public async Task<bool> SendNotificationAsync(string url, object payload, int maxRetries = 3)
+    {
+        if (_permanentFailure || _failureCount > 0)
+        {
+            if (_failureCount > 0) _failureCount--;
+            return false;
+        }
+
+        // Simulate network delay
+        await Task.Delay(50);
+        return true;
+    }
+
+    public async Task<bool> SendOrderConfirmationEmailAsync(string toEmail, string orderId, string totalAmount, object items)
+    {
+        if (_permanentFailure || _failureCount > 0)
+        {
+            if (_failureCount > 0) _failureCount--;
+            return false;
+        }
+
+        var sentEmail = new SentEmail
+        {
+            ToEmail = toEmail,
+            TemplateId = "order-confirmation",
+            Data = new Dictionary<string, string>
+            {
+                ["orderId"] = orderId,
+                ["totalAmount"] = totalAmount,
+                ["items"] = items.ToString() ?? ""
+            }
+        };
+
+        _sentEmails.Add(sentEmail);
+        return true;
+    }
+}
+
+public class SentEmail
+{
+    public string ToEmail { get; set; } = string.Empty;
+    public string TemplateId { get; set; } = string.Empty;
+    public Dictionary<string, string> Data { get; set; } = new();
+}

@@ -1,0 +1,31 @@
+{
+    "IsEncrypted": false,
+    "Values": {
+        "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+        "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+        
+        "// REQUIRED: Stripe Configuration": "1. Go to https://dashboard.stripe.com/test/apikeys",
+        "// ": "2. Copy your Secret key (starts with sk_test_)",
+        "// ": "3. Copy your Publishable key (starts with pk_test_)", 
+        "Stripe__SecretKey": "sk_test_YOUR_STRIPE_SECRET_KEY_HERE",
+        "Stripe__PublishableKey": "pk_test_YOUR_STRIPE_PUBLISHABLE_KEY_HERE",
+        "STRIPE_PUBLISHABLE_KEY": "pk_test_YOUR_STRIPE_PUBLISHABLE_KEY_HERE",
+        
+        "// Application URLs": "Update these for your local development setup",
+        "APP_BASE_URL": "https://localhost:5001",
+        "ALLOWED_ORIGIN": "https://localhost:5001",
+        
+        "// Database Configuration": "Cosmos DB Emulator connection",
+        "CosmosDb__ConnectionString": "AccountEndpoint=https://localhost:8081/;AccountKey=C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==",
+        "CosmosDb__DatabaseName": "StripeWorkflow",
+        "RepositoryProvider": "Cosmos",
+        
+        "// Notification Services (Optional)": "Add these if using notifications",
+        "SENDGRID_API_KEY": "SG.YOUR_SENDGRID_API_KEY_HERE",
+        "TWILIO_ACCOUNT_SID": "YOUR_TWILIO_ACCOUNT_SID_HERE",
+        "TWILIO_AUTH_TOKEN": "YOUR_TWILIO_AUTH_TOKEN_HERE",
+        
+        "// Webhook Configuration": "For webhooks function",
+        "STRIPE_WEBHOOK_SECRET": "whsec_YOUR_WEBHOOK_ENDPOINT_SECRET_HERE"
+    }
+}

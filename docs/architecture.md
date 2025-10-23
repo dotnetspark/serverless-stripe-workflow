@@ -306,7 +306,7 @@ public static async Task ProcessOrderChanges(
 
 ### Infrastructure as Code (ARM Templates)
 
-#### **Main Template Structure**
+#### **Cost-Optimized ARM Template**
 
 ```json
 {
@@ -319,15 +319,37 @@ public static async Task ProcessOrderChanges(
   },
   "resources": [
     {
-      "type": "Microsoft.Web/serverfarms",
+      "type": "Microsoft.Web/sites",
       "apiVersion": "2021-02-01",
-      "name": "[concat('asp-', parameters('environmentName'))]",
+      "name": "[concat('func-', parameters('environmentName'))]",
       "properties": {
-        "name": "[concat('asp-', parameters('environmentName'))]",
-        "sku": {
-          "name": "EP1",
-          "tier": "ElasticPremium"
+        "serverFarmId": null,
+        "siteConfig": {
+          "appSettings": [
+            {
+              "name": "FUNCTIONS_WORKER_RUNTIME",
+              "value": "dotnet-isolated"
+            },
+            {
+              "name": "FUNCTIONS_EXTENSION_VERSION",
+              "value": "~4"
+            }
+          ]
         }
+      },
+      "kind": "functionapp"
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts",
+      "apiVersion": "2021-10-15",
+      "name": "[concat('cosmos-', parameters('environmentName'))]",
+      "properties": {
+        "databaseAccountOfferType": "Standard",
+        "capabilities": [
+          {
+            "name": "EnableServerless"
+          }
+        ]
       }
     }
   ]
@@ -463,38 +485,44 @@ public static async Task<IActionResult> HealthCheck(
 
 ### Auto-Scaling Configuration
 
-#### **Function App Scaling**
+#### **Serverless Auto-Scaling (Cost Optimized)**
 
 ```json
 {
-  "functionAppScaleLimit": 200,
-  "routingRules": [
-    {
-      "name": "ProductCatalog",
-      "functionName": "GetProducts",
-      "scaleOutCooldown": "00:01:00",
-      "scaleInCooldown": "00:05:00"
-    }
-  ]
+  "functionApp": {
+    "plan": "Consumption",
+    "scaleLimit": 200,
+    "alwaysReady": 0,
+    "preWarmedInstances": 0
+  },
+  "cosmosDb": {
+    "mode": "Serverless",
+    "autoScale": true,
+    "maxRequestUnits": "Auto-managed by Azure"
+  }
 }
 ```
 
-#### **Cosmos DB Scaling**
+#### **Serverless Cosmos DB (No Manual Scaling Needed)**
 
 ```csharp
-public class CosmosScalingService
+public class CosmosServerlessService
 {
-    public async Task ScaleContainer(string containerName, int targetRU)
+    // Serverless Cosmos DB automatically scales
+    // No manual RU management required
+    // Pay only for consumed Request Units
+    
+    public async Task<ItemResponse<Order>> CreateOrderAsync(Order order)
     {
-        var container = _cosmosClient.GetContainer("StripeWorkflow", containerName);
-        await container.ReplaceThroughputAsync(targetRU);
+        // Cosmos DB serverless automatically handles scaling
+        var container = _cosmosClient.GetContainer("StripeWorkflow", "Orders");
+        return await container.CreateItemAsync(order, new PartitionKey(order.CustomerId));
     }
-
-    public async Task EnableAutoscale(string containerName, int maxRU)
-    {
-        var autoscaleSettings = ThroughputProperties.CreateAutoscaleThroughput(maxRU);
-        await container.ReplaceThroughputAsync(autoscaleSettings);
-    }
+    
+    // Cost is automatically optimized:
+    // - Pay per request (RU consumed)
+    // - No provisioned throughput
+    // - Automatic scaling to zero when idle
 }
 ```
 
@@ -530,20 +558,38 @@ public class CosmosScalingService
 
 ## Cost Optimization
 
-### Resource Sizing Strategy
+### Resource Sizing Strategy (Cost-Conscious Portfolio Approach)
 
-- **Functions**: Start with EP1 (Elastic Premium) for consistent performance
-- **Cosmos DB**: Begin with 400 RU/s with autoscale to 4000 RU/s
-- **B2C**: Free tier supports up to 50,000 users/month
-- **Application Insights**: Configure sampling to control costs
+- **Functions**: Consumption Plan (pay-per-execution) - FREE for first 1M executions
+- **Cosmos DB**: Serverless mode (pay-per-request) - FREE for first 1000 RU/s + 25GB
+- **B2C**: Free tier supports up to 50,000 users/month - FREE
+- **Application Insights**: Free tier (5GB/month) with aggressive sampling - FREE
+- **Static Web Apps**: FREE hosting for frontend
+- **Storage Account**: Locally Redundant Storage (LRS) - ~$2/month
 
-### Estimated Monthly Costs (Production)
+### Estimated Monthly Costs (Portfolio/Demo)
 
-- Azure Functions (EP1): ~$150/month
-- Cosmos DB (4000 RU/s): ~$300/month
-- Azure B2C (Premium): ~$0.0055 per user/month
-- Application Insights: ~$50/month
-- **Total**: ~$500-600/month for moderate usage
+**Development & Demo Usage:**
+- Azure Functions (Consumption): FREE (under 1M executions)
+- Cosmos DB (Serverless): FREE (under free tier limits)
+- Azure B2C (Free): FREE (under 50K users)
+- Application Insights (Free): FREE (under 5GB)
+- Static Web Apps: FREE
+- Storage Account: ~$2/month
+- **Total**: ~$2-5/month for demo usage
+
+**Production Scale (if needed):**
+- Azure Functions (Consumption): ~$10-20/month
+- Cosmos DB (Serverless): ~$25-50/month  
+- Application Insights: ~$10/month
+- **Total**: ~$45-80/month for production usage
+
+### Cost-Conscious Architecture Decisions
+
+1. **Serverless-Only**: No always-on compute costs
+2. **Free Tier Maximization**: Leverage all available free tiers
+3. **Pay-Per-Use**: Only pay for actual usage, not reserved capacity
+4. **Local Development**: Use emulators to minimize cloud costs during development
 
 ---
 

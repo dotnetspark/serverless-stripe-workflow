@@ -2,8 +2,22 @@ using Aspire.Hosting;
 
 var builder = DistributedApplication.CreateBuilder(args);
 
+// Common environment variables for Azure Functions
+var functionEnvironment = new Dictionary<string, string>
+{
+    ["PATH"] = $"C:\\nvm4w\\nodejs\\node_modules\\azure-functions-core-tools\\bin;{Environment.GetEnvironmentVariable("PATH")}"
+};
+
 var cosmosDb = builder.AddAzureCosmosDB("cosmosdb")
-    .RunAsEmulator();
+    .RunAsEmulator(emulator =>
+    {
+        emulator.WithDataVolume(); // Persist data between runs
+        emulator.WithLifetime(ContainerLifetime.Persistent); // Keep container running
+    });
+
+// Add the database and container using Aspire's built-in approach
+var stripeWorkflowDb = cosmosDb.AddCosmosDatabase("StripeWorkflow");
+var ordersContainer = stripeWorkflowDb.AddContainer("orders", "/id");
 
 var serviceBus = builder.AddAzureServiceBus("messaging")
     .RunAsEmulator();
@@ -27,6 +41,8 @@ var checkoutFn = builder.AddAzureFunctionsProject<Projects.CheckoutFn>("checkout
     .WithReference(orderSubmittedQueue)
     .WithReference(serviceBus)
     .WithHostStorage(storage)
+    .WithEnvironment("PATH", $"C:\\nvm4w\\nodejs\\node_modules\\azure-functions-core-tools\\bin;{Environment.GetEnvironmentVariable("PATH")}")
+    .WithEnvironment("ServiceBusConnection", serviceBus.Resource.ConnectionStringExpression)
     .WaitFor(storage)
     .WaitFor(cosmosDb)
     .WaitFor(serviceBus);
@@ -35,15 +51,20 @@ var webhooksFn = builder.AddAzureFunctionsProject<Projects.WebhooksFn>("webhooks
     .WithExternalHttpEndpoints()
     .WithReference(cosmosDb)
     .WithHostStorage(storage)
+    .WithEnvironment("PATH", $"C:\\nvm4w\\nodejs\\node_modules\\azure-functions-core-tools\\bin;{Environment.GetEnvironmentVariable("PATH")}")
     .WaitFor(storage)
     .WaitFor(cosmosDb);
 
 var notifyFn = builder.AddAzureFunctionsProject<Projects.NotifyFn>("notify-function")
     .WithExternalHttpEndpoints()
     .WithReference(cosmosDb)
+    .WithReference(serviceBus)
     .WithHostStorage(storage)
+    .WithEnvironment("PATH", $"C:\\nvm4w\\nodejs\\node_modules\\azure-functions-core-tools\\bin;{Environment.GetEnvironmentVariable("PATH")}")
+    .WithEnvironment("ServiceBusConnection", serviceBus.Resource.ConnectionStringExpression)
     .WaitFor(storage)
-    .WaitFor(cosmosDb);
+    .WaitFor(cosmosDb)
+    .WaitFor(serviceBus);
 
 var webApi = builder.AddProject<Projects.WebApi>("web-api")
     .WithExternalHttpEndpoints()

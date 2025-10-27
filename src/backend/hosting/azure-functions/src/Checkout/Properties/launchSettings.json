@@ -1,22 +1,13 @@
 {
   "$schema": "https://json.schemastore.org/launchsettings.json",
   "profiles": {
-    "http": {
+    "CheckoutFn": {
       "commandName": "Project",
       "dotnetRunMessages": true,
-      "launchBrowser": true,
-      "applicationUrl": "http://localhost:5063",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
-      }
-    },
-    "https": {
-      "commandName": "Project",
-      "dotnetRunMessages": true,
-      "launchBrowser": true,
-      "applicationUrl": "https://localhost:7181;http://localhost:5063",
-      "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development"
+        "AZURE_FUNCTIONS_ENVIRONMENT": "Development",
+        "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+        "PATH": "C:\\nvm4w\\nodejs\\node_modules\\azure-functions-core-tools\\bin;%PATH%"
       }
     }
   }

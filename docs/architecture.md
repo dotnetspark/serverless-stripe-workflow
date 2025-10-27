@@ -511,14 +511,14 @@ public class CosmosServerlessService
     // Serverless Cosmos DB automatically scales
     // No manual RU management required
     // Pay only for consumed Request Units
-    
+
     public async Task<ItemResponse<Order>> CreateOrderAsync(Order order)
     {
         // Cosmos DB serverless automatically handles scaling
         var container = _cosmosClient.GetContainer("StripeWorkflow", "Orders");
         return await container.CreateItemAsync(order, new PartitionKey(order.CustomerId));
     }
-    
+
     // Cost is automatically optimized:
     // - Pay per request (RU consumed)
     // - No provisioned throughput
@@ -570,6 +570,7 @@ public class CosmosServerlessService
 ### Estimated Monthly Costs (Portfolio/Demo)
 
 **Development & Demo Usage:**
+
 - Azure Functions (Consumption): FREE (under 1M executions)
 - Cosmos DB (Serverless): FREE (under free tier limits)
 - Azure B2C (Free): FREE (under 50K users)
@@ -579,8 +580,9 @@ public class CosmosServerlessService
 - **Total**: ~$2-5/month for demo usage
 
 **Production Scale (if needed):**
+
 - Azure Functions (Consumption): ~$10-20/month
-- Cosmos DB (Serverless): ~$25-50/month  
+- Cosmos DB (Serverless): ~$25-50/month
 - Application Insights: ~$10/month
 - **Total**: ~$45-80/month for production usage
 
